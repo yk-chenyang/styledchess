@@ -1,0 +1,111 @@
+// Switch provider to "postgresql" for production
+// DATABASE_URL="postgresql://user:password@host:5432/styledchess"
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  password      String?
+  image         String?
+  role          String    @default("USER") // USER | MEMBER | ADMIN
+  accounts      Account[]
+  sessions      Session[]
+  chessBots     ChessBot[]
+  games         ChessGame[]
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model ChessBot {
+  id             String        @id @default(cuid())
+  name           String
+  userId         String?
+  user           User?         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  guestToken     String?       // for guest users (no account)
+  status         String        @default("PENDING") // PENDING | TRAINING | READY | FAILED
+  styleParams    String?       // JSON: style metrics computed from games
+  openingBook    String?       // JSON: FEN -> weighted moves map (first 25 moves)
+  targetName     String        // player name whose style is being mimicked
+  platform       String?       // "chessdotcom" | "lichess" | "manual"
+  gamesCount     Int           @default(0)
+  estimatedElo   Int?
+  errorMessage   String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  games          ChessGame[]
+  trainingGames  TrainingGame[]
+}
+
+model TrainingGame {
+  id          String   @id @default(cuid())
+  botId       String
+  bot         ChessBot @relation(fields: [botId], references: [id], onDelete: Cascade)
+  pgn         String
+  playerColor String   // "white" | "black"
+  result      String?  // "1-0" | "0-1" | "1/2-1/2" | "*"
+  createdAt   DateTime @default(now())
+}
+
+model ChessGame {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  botId     String
+  bot       ChessBot @relation(fields: [botId], references: [id])
+  pgn       String
+  result    String   // "1-0" | "0-1" | "1/2-1/2" | "*"
+  userColor String   // "white" | "black"
+  accuracy  Float?   // user's average accuracy (0-100)
+  createdAt DateTime @default(now())
+}
+
+// Email verification codes
+model EmailVerificationCode {
+  id        String   @id @default(cuid())
+  email     String
+  code      String
+  expires   DateTime
+  createdAt DateTime @default(now())
+}
+
+// NextAuth required models
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+  @@unique([identifier, token])
+}
