@@ -41,6 +41,7 @@ export default function ChessBoard({ botId, userColor, guestToken, stockfishConf
   const [annotatedMoves, setAnnotatedMoves] = useState<AnnotatedMove[]>([]);
   const [lastMove, setLastMove] = useState<{ from: string; to: string } | null>(null);
   const [botThinking, setBotThinking] = useState(false);
+  const [botError, setBotError] = useState('');
   const stockfish = useStockfish();
   const gameRef = useRef(game);
   const botRequestedRef = useRef(false);
@@ -79,7 +80,7 @@ export default function ChessBoard({ botId, userColor, guestToken, stockfishConf
         moveStr = data.move;
       } else {
         // Use Stockfish with style config
-        const cfg = stockfishConfig ?? data.stockfishConfig ?? { skillLevel: 10, contempt: 0, moveTime: 1000 };
+        const cfg = stockfishConfig ?? data.stockfishConfig ?? { skillLevel: 10, contempt: 0 };
         moveStr = await stockfish.getBestMove(fenStr, cfg);
       }
 
@@ -104,8 +105,9 @@ export default function ChessBoard({ botId, userColor, guestToken, stockfishConf
         setGameResult(result);
         onGameEnd?.(newGame.pgn(), result, userColor);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Bot move error:', err);
+      setBotError('Bot engine error: ' + (err?.message ?? 'unknown error') + '. Refresh the page to retry.');
     } finally {
       setBotThinking(false);
       botRequestedRef.current = false;
@@ -174,6 +176,7 @@ export default function ChessBoard({ botId, userColor, guestToken, stockfishConf
     setGameResult('');
     setAnnotatedMoves([]);
     setLastMove(null);
+    setBotError('');
     botRequestedRef.current = false;
   }, []);
 
@@ -241,6 +244,13 @@ export default function ChessBoard({ botId, userColor, guestToken, stockfishConf
             areArrowsAllowed
           />
         </div>
+
+        {/* Engine error */}
+        {botError && (
+          <div className="bg-red-900/30 border border-red-600/50 text-red-300 rounded-lg px-3 py-2 text-sm">
+            {botError}
+          </div>
+        )}
 
         {/* Controls */}
         <div className="flex gap-3">

@@ -60,7 +60,12 @@ export default function GameReview({ pgn }: Props) {
 
     for (const move of history) {
       positions.push({ fen: replay.fen(), move });
-      replay.move(move.san);
+      // Use from/to instead of SAN — unambiguous regardless of notation quirks
+      try {
+        replay.move({ from: move.from, to: move.to, promotion: move.promotion });
+      } catch {
+        break; // PGN went out of sync; stop here
+      }
     }
 
     const results: MoveReview[] = [];
@@ -74,7 +79,7 @@ export default function GameReview({ pgn }: Props) {
         const before = await stockfish.analyzePosition(fen, 16);
         // Make the move and evaluate after
         const afterGame = new Chess(fen);
-        afterGame.move(move.san);
+        afterGame.move({ from: move.from, to: move.to, promotion: move.promotion });
         const after = await stockfish.analyzePosition(afterGame.fen(), 16);
 
         // CP loss from perspective of the moving side

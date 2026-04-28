@@ -5,7 +5,7 @@ import { useEffect, useRef, useCallback, useState } from 'react';
 export interface StockfishConfig {
   skillLevel?: number;  // 0-20
   contempt?: number;    // -100 to 100
-  moveTime?: number;    // ms
+  moveTime?: number;    // ms (unused now, kept for API compat)
 }
 
 export function useStockfish() {
@@ -21,7 +21,10 @@ export function useStockfish() {
 
       worker.onmessage = (e: MessageEvent) => {
         const msg = typeof e.data === 'string' ? e.data : e.data?.toString() ?? '';
+
         if (msg === 'uciok') {
+          // Disable NNUE so engine works without the 60MB network file
+          worker.postMessage('setoption name Use NNUE value false');
           worker.postMessage('isready');
         } else if (msg === 'readyok') {
           setReady(true);
@@ -31,18 +34,22 @@ export function useStockfish() {
           if (resolverRef.current && bestMove && bestMove !== '(none)') {
             resolverRef.current(bestMove);
             resolverRef.current = null;
+          } else if (resolverRef.current) {
+            // Engine said (none) — no legal moves (shouldn't happen, but handle it)
+            resolverRef.current = null;
           }
         }
       };
 
       worker.onerror = (e) => {
         console.error('Stockfish worker error:', e);
+        setReady(false);
       };
 
       worker.postMessage('uci');
 
       return () => {
-        worker.postMessage('quit');
+        try { worker.postMessage('quit'); } catch {}
         worker.terminate();
       };
     } catch (err) {
@@ -70,32 +77,43 @@ export function useStockfish() {
           return;
         }
 
-        // Cancel any in-progress analysis
+        // Stop any previous search
         w.postMessage('stop');
 
         if (config) configure(config);
 
         resolverRef.current = resolve;
 
-        const moveTime = config?.moveTime ?? 1000;
-        w.postMessage('ucinewgame');
-        w.postMessage(`position fen ${fen}`);
-        w.postMessage(`go movetime ${moveTime}`);
+        // Use depth-limited search — much more reliable than movetime in WASM workers
+        // because timer callbacks can be unreliable in the Emscripten asyncify runtime.
+        const skillLevel = config?.skillLevel ?? 10;
+        const depth = Math.max(4, Math.min(16, Math.round(skillLevel * 0.7 + 4)));
 
-        // Safety timeout
-        setTimeout(() => {
+        w.postMessage(`position fen ${fen}`);
+        w.postMessage(`go depth ${depth}`);
+
+        // Hard timeout fallback (30s should be more than enough for depth ≤ 16)
+        const timer = setTimeout(() => {
           if (resolverRef.current) {
             resolverRef.current = null;
+            w.postMessage('stop');
             reject(new Error('Stockfish timed out'));
           }
-        }, moveTime + 5000);
+        }, 30_000);
+
+        // Wrap resolve to also clear the timer
+        const originalResolver = resolve;
+        resolverRef.current = (move: string) => {
+          clearTimeout(timer);
+          originalResolver(move);
+        };
       });
     },
     [configure]
   );
 
   const analyzePosition = useCallback(
-    (fen: string, depth = 18): Promise<{ score: number; bestMove: string; pv: string[] }> => {
+    (fen: string, depth = 16): Promise<{ score: number; bestMove: string; pv: string[] }> => {
       return new Promise((resolve) => {
         const w = workerRef.current;
         if (!w) {

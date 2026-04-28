@@ -104,23 +104,26 @@ export function trainBot(
 
       const fen = normalizeFen(chess.fen());
 
+      let moveResult;
+      try {
+        moveResult = chess.move(san);
+        if (!moveResult) break;
+      } catch {
+        break;
+      }
+
       if (isPlayerTurn) {
         totalMoves++;
         if (san.includes('x')) totalCaptures++;
         if (san.includes('+') || san.includes('#')) totalAttacks++;
 
-        // Record in opening book (only first MAX_BOOK_DEPTH plies)
+        // Store as UCI (e.g. "e7e5", "g8f6") so the board can apply it directly.
+        // SAN varies by context; UCI from+to is unambiguous.
         if (ply < MAX_BOOK_DEPTH) {
+          const uci = moveResult.from + moveResult.to + (moveResult.promotion ?? '');
           if (!openingBook[fen]) openingBook[fen] = {};
-          openingBook[fen][san] = (openingBook[fen][san] ?? 0) + 1;
+          openingBook[fen][uci] = (openingBook[fen][uci] ?? 0) + 1;
         }
-      }
-
-      try {
-        const result = chess.move(san);
-        if (!result) break;
-      } catch {
-        break;
       }
 
       ply++;
