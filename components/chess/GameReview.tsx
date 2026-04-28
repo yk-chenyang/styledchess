@@ -82,7 +82,7 @@ export default function GameReview({ pgn }: Props) {
         // Make the move and evaluate after
         const afterGame = new Chess(fen);
         afterGame.move({ from: move.from, to: move.to, promotion: move.promotion });
-        const after = await stockfish.analyzePosition(afterGame.fen(), 16);
+        const after = await stockfish.analyzePosition(afterGame.fen(), 10);
 
         // CP loss from perspective of the moving side
         const cpBefore = move.color === 'w' ? before.score : -before.score;

@@ -114,7 +114,7 @@ export function useStockfish() {
 
   const analyzePosition = useCallback(
     (fen: string, depth = 10): Promise<{ score: number; bestMove: string; pv: string[] }> => {
-      return new Promise((resolve, reject) => {
+      return new Promise((resolve) => {
         const w = workerRef.current;
         if (!w) {
           resolve({ score: 0, bestMove: '', pv: [] });
@@ -125,23 +125,46 @@ export function useStockfish() {
         let bestMoveStr = '';
         let pvLine: string[] = [];
         let done = false;
+        let searchStarted = false;
+        let finishTimer: ReturnType<typeof setTimeout>;
 
         const finish = (result: { score: number; bestMove: string; pv: string[] }) => {
           if (done) return;
           done = true;
-          clearTimeout(timer);
+          clearTimeout(finishTimer);
+          clearTimeout(stopFallback);
           w.removeEventListener('message', handler);
           resolve(result);
         };
 
-        // Safety timeout — should never hit with depth ≤ 10, but avoids hangs
-        const timer = setTimeout(() => {
-          finish({ score: bestScore, bestMove: bestMoveStr, pv: pvLine });
-        }, 20_000);
+        const startSearch = () => {
+          searchStarted = true;
+          w.postMessage(`position fen ${fen}`);
+          w.postMessage(`go depth ${depth}`);
+          // If search takes too long, stop it so the worker is freed for the next call
+          finishTimer = setTimeout(() => {
+            w.postMessage('stop');
+            finish({ score: bestScore, bestMove: bestMoveStr, pv: pvLine });
+          }, 15_000);
+        };
+
+        // If the engine was idle, stop produces no bestmove — start after 100ms anyway
+        const stopFallback = setTimeout(() => {
+          if (!searchStarted) startSearch();
+        }, 100);
 
         const handler = (e: MessageEvent) => {
           const msg = typeof e.data === 'string' ? e.data : '';
           if (done) return;
+
+          if (!searchStarted) {
+            // Waiting for stop-response from any prior search
+            if (msg.startsWith('bestmove')) {
+              clearTimeout(stopFallback);
+              startSearch();
+            }
+            return;
+          }
 
           if (msg.startsWith('info depth')) {
             const scoreMatch = msg.match(/score cp (-?\d+)/);
@@ -158,12 +181,10 @@ export function useStockfish() {
           }
         };
 
-        // analyzePosition calls are always awaited sequentially, so the
-        // engine is idle here — no stop needed (stop triggers its own
-        // bestmove that would fire this handler with empty data).
+        // Register handler first, then stop any running search.
+        // Handler waits for the stop-response before starting our search.
         w.addEventListener('message', handler);
-        w.postMessage(`position fen ${fen}`);
-        w.postMessage(`go depth ${depth}`);
+        w.postMessage('stop');
       });
     },
     []
