@@ -113,8 +113,8 @@ export function useStockfish() {
   );
 
   const analyzePosition = useCallback(
-    (fen: string, depth = 16): Promise<{ score: number; bestMove: string; pv: string[] }> => {
-      return new Promise((resolve) => {
+    (fen: string, depth = 10): Promise<{ score: number; bestMove: string; pv: string[] }> => {
+      return new Promise((resolve, reject) => {
         const w = workerRef.current;
         if (!w) {
           resolve({ score: 0, bestMove: '', pv: [] });
@@ -125,6 +125,19 @@ export function useStockfish() {
         let bestMoveStr = '';
         let pvLine: string[] = [];
         let done = false;
+
+        const finish = (result: { score: number; bestMove: string; pv: string[] }) => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          w.removeEventListener('message', handler);
+          resolve(result);
+        };
+
+        // Safety timeout — should never hit with depth ≤ 10, but avoids hangs
+        const timer = setTimeout(() => {
+          finish({ score: bestScore, bestMove: bestMoveStr, pv: pvLine });
+        }, 20_000);
 
         const handler = (e: MessageEvent) => {
           const msg = typeof e.data === 'string' ? e.data : '';
@@ -140,17 +153,21 @@ export function useStockfish() {
           }
 
           if (msg.startsWith('bestmove')) {
-            done = true;
             bestMoveStr = msg.split(' ')[1] ?? '';
-            w.removeEventListener('message', handler);
-            resolve({ score: bestScore, bestMove: bestMoveStr, pv: pvLine });
+            finish({ score: bestScore, bestMove: bestMoveStr, pv: pvLine });
           }
         };
 
-        w.addEventListener('message', handler);
+        // Register listener AFTER sending stop so any stop-triggered
+        // bestmove fires before our handler is attached
         w.postMessage('stop');
-        w.postMessage(`position fen ${fen}`);
-        w.postMessage(`go depth ${depth}`);
+        // Small async gap: listener added on next microtask so the stop
+        // response (if any) has already been dispatched to existing listeners
+        Promise.resolve().then(() => {
+          w.addEventListener('message', handler);
+          w.postMessage(`position fen ${fen}`);
+          w.postMessage(`go depth ${depth}`);
+        });
       });
     },
     []

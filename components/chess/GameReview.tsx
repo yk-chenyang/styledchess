@@ -44,12 +44,14 @@ export default function GameReview({ pgn }: Props) {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [analyzing, setAnalyzing] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [analyzeError, setAnalyzeError] = useState('');
   const stockfish = useStockfish();
 
   const analyze = useCallback(async () => {
     if (!stockfish.ready) return;
     setAnalyzing(true);
     setReviews([]);
+    setAnalyzeError('');
 
     const game = new Chess();
     game.loadPgn(pgn);
@@ -103,6 +105,9 @@ export default function GameReview({ pgn }: Props) {
       }
     }
 
+    if (results.length === 0) {
+      setAnalyzeError('Analysis produced no results. The engine may still be loading — wait a moment and try again.');
+    }
     setReviews(results);
     setCurrentIndex(0);
     setAnalyzing(false);
@@ -134,6 +139,12 @@ export default function GameReview({ pgn }: Props) {
           </span>
         )}
       </div>
+
+      {analyzeError && (
+        <div className="bg-red-900/30 border border-red-600/50 text-red-300 rounded-lg px-3 py-2 text-sm">
+          {analyzeError}
+        </div>
+      )}
 
       {reviews.length > 0 && (
         <div className="flex flex-col lg:flex-row gap-4">
