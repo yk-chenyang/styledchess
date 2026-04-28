@@ -78,7 +78,7 @@ export default function GameReview({ pgn }: Props) {
 
       try {
         // Evaluate position before the move
-        const before = await stockfish.analyzePosition(fen, 16);
+        const before = await stockfish.analyzePosition(fen, 10);
         // Make the move and evaluate after
         const afterGame = new Chess(fen);
         afterGame.move({ from: move.from, to: move.to, promotion: move.promotion });

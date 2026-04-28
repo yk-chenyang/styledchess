@@ -158,16 +158,12 @@ export function useStockfish() {
           }
         };
 
-        // Register listener AFTER sending stop so any stop-triggered
-        // bestmove fires before our handler is attached
-        w.postMessage('stop');
-        // Small async gap: listener added on next microtask so the stop
-        // response (if any) has already been dispatched to existing listeners
-        Promise.resolve().then(() => {
-          w.addEventListener('message', handler);
-          w.postMessage(`position fen ${fen}`);
-          w.postMessage(`go depth ${depth}`);
-        });
+        // analyzePosition calls are always awaited sequentially, so the
+        // engine is idle here — no stop needed (stop triggers its own
+        // bestmove that would fire this handler with empty data).
+        w.addEventListener('message', handler);
+        w.postMessage(`position fen ${fen}`);
+        w.postMessage(`go depth ${depth}`);
       });
     },
     []
