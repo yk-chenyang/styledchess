@@ -21,6 +21,7 @@ export function useStockfish() {
 
       worker.onmessage = (e: MessageEvent) => {
         const msg = typeof e.data === 'string' ? e.data : e.data?.toString() ?? '';
+        if (!msg.startsWith('info')) console.log('[SF worker]', msg.slice(0, 80));
 
         if (msg === 'uciok') {
           // Disable NNUE so engine works without the 60MB network file
@@ -181,6 +182,7 @@ export function useStockfish() {
           }
         };
 
+        console.log('[useStockfish] analyzePosition called, fen:', fen.slice(0, 40), 'depth:', depth);
         // Register handler first, then stop any running search.
         // Handler waits for the stop-response before starting our search.
         w.addEventListener('message', handler);

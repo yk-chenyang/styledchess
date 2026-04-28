@@ -53,9 +53,12 @@ export default function GameReview({ pgn }: Props) {
     setReviews([]);
     setAnalyzeError('');
 
+    console.log('[GameReview] pgn length:', pgn.length, 'pgn preview:', pgn.slice(0, 100));
+
     const game = new Chess();
-    game.loadPgn(pgn);
+    try { game.loadPgn(pgn); } catch (e) { console.error('[GameReview] loadPgn threw:', e); }
     const history = game.history({ verbose: true });
+    console.log('[GameReview] history length:', history.length);
 
     const positions: { fen: string; move: (typeof history)[0] }[] = [];
     const replay = new Chess();
@@ -70,6 +73,7 @@ export default function GameReview({ pgn }: Props) {
       }
     }
 
+    console.log('[GameReview] positions to analyze:', positions.length);
     const results: MoveReview[] = [];
 
     for (let i = 0; i < positions.length; i++) {
@@ -79,10 +83,12 @@ export default function GameReview({ pgn }: Props) {
       try {
         // Evaluate position before the move
         const before = await stockfish.analyzePosition(fen, 10);
+        console.log(`[GameReview] pos ${i} before:`, before);
         // Make the move and evaluate after
         const afterGame = new Chess(fen);
         afterGame.move({ from: move.from, to: move.to, promotion: move.promotion });
         const after = await stockfish.analyzePosition(afterGame.fen(), 10);
+        console.log(`[GameReview] pos ${i} after:`, after);
 
         // CP loss from perspective of the moving side
         const cpBefore = move.color === 'w' ? before.score : -before.score;
