@@ -5,13 +5,20 @@ import { useEffect, useRef, useCallback, useState } from 'react';
 export interface StockfishConfig {
   skillLevel?: number;  // 0-20
   contempt?: number;    // -100 to 100
-  moveTime?: number;    // ms (unused now, kept for API compat)
+  moveTime?: number;    // kept for API compat
 }
 
 export function useStockfish() {
   const workerRef = useRef<Worker | null>(null);
-  const resolverRef = useRef<((move: string) => void) | null>(null);
   const [ready, setReady] = useState(false);
+
+  /**
+   * Single message dispatcher.
+   * All worker messages route here first. When a getBestMove / analyzePosition
+   * call is in flight it sets this ref to its own handler, which returns true
+   * to consume the message. Unhandled messages fall through to UCI init logic.
+   */
+  const activeCallbackRef = useRef<((msg: string) => boolean) | null>(null);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -20,36 +27,32 @@ export function useStockfish() {
       workerRef.current = worker;
 
       worker.onmessage = (e: MessageEvent) => {
-        const msg = typeof e.data === 'string' ? e.data : e.data?.toString() ?? '';
-        if (!msg.startsWith('info')) console.log('[SF worker]', msg.slice(0, 80));
+        const msg = typeof e.data === 'string' ? e.data : (e.data?.toString() ?? '');
 
+        // Route to the active operation first
+        if (activeCallbackRef.current) {
+          const consumed = activeCallbackRef.current(msg);
+          if (consumed) return;
+        }
+
+        // UCI init / idle handling
         if (msg === 'uciok') {
-          // Disable NNUE so engine works without the 60MB network file
           worker.postMessage('setoption name Use NNUE value false');
           worker.postMessage('isready');
         } else if (msg === 'readyok') {
           setReady(true);
-        } else if (msg.startsWith('bestmove')) {
-          const parts = msg.split(' ');
-          const bestMove = parts[1] ?? '';
-          if (resolverRef.current && bestMove && bestMove !== '(none)') {
-            resolverRef.current(bestMove);
-            resolverRef.current = null;
-          } else if (resolverRef.current) {
-            // Engine said (none) — no legal moves (shouldn't happen, but handle it)
-            resolverRef.current = null;
-          }
         }
+        // bestmove with no active callback → stale, ignored
       };
 
       worker.onerror = (e) => {
         console.error('Stockfish worker error:', e);
-        setReady(false);
       };
 
       worker.postMessage('uci');
 
       return () => {
+        activeCallbackRef.current = null;
         try { worker.postMessage('quit'); } catch {}
         worker.terminate();
       };
@@ -61,135 +64,148 @@ export function useStockfish() {
   const configure = useCallback((config: StockfishConfig) => {
     const w = workerRef.current;
     if (!w) return;
-    if (config.skillLevel !== undefined) {
+    if (config.skillLevel !== undefined)
       w.postMessage(`setoption name Skill Level value ${config.skillLevel}`);
-    }
-    if (config.contempt !== undefined) {
+    if (config.contempt !== undefined)
       w.postMessage(`setoption name Contempt value ${config.contempt}`);
-    }
   }, []);
 
+  /**
+   * Stop any in-flight search and wait for the engine to become idle.
+   * Resolves immediately if the engine was already idle (50 ms fallback).
+   */
+  const stopAndWait = useCallback((): Promise<void> => {
+    return new Promise<void>((resolve) => {
+      const w = workerRef.current;
+      if (!w) { resolve(); return; }
+
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(fallback);
+        // Only clear our own callback
+        if (activeCallbackRef.current === handler) activeCallbackRef.current = null;
+        resolve();
+      };
+
+      // If the engine is already idle stop produces no output → 50 ms fallback
+      const fallback = setTimeout(finish, 50);
+
+      const handler = (msg: string): boolean => {
+        if (msg.startsWith('bestmove')) { finish(); return true; }
+        return false; // let non-bestmove messages fall through (e.g. info lines)
+      };
+
+      activeCallbackRef.current = handler;
+      w.postMessage('stop');
+    });
+  }, []);
+
+  // ─── getBestMove ──────────────────────────────────────────────────────────
+
   const getBestMove = useCallback(
-    (fen: string, config?: StockfishConfig): Promise<string> => {
-      return new Promise((resolve, reject) => {
-        const w = workerRef.current;
-        if (!w) {
-          reject(new Error('Stockfish not initialized'));
-          return;
-        }
+    async (fen: string, config?: StockfishConfig): Promise<string> => {
+      const w = workerRef.current;
+      if (!w) throw new Error('Stockfish not initialized');
 
-        // Stop any previous search
-        w.postMessage('stop');
+      await stopAndWait();
+      if (config) configure(config);
 
-        if (config) configure(config);
+      const skillLevel = config?.skillLevel ?? 10;
+      const depth = Math.max(4, Math.min(16, Math.round(skillLevel * 0.7 + 4)));
 
-        resolverRef.current = resolve;
-
-        // Use depth-limited search — much more reliable than movetime in WASM workers
-        // because timer callbacks can be unreliable in the Emscripten asyncify runtime.
-        const skillLevel = config?.skillLevel ?? 10;
-        const depth = Math.max(4, Math.min(16, Math.round(skillLevel * 0.7 + 4)));
-
-        w.postMessage(`position fen ${fen}`);
-        w.postMessage(`go depth ${depth}`);
-
-        // Hard timeout fallback (30s should be more than enough for depth ≤ 16)
+      return new Promise<string>((resolve, reject) => {
         const timer = setTimeout(() => {
-          if (resolverRef.current) {
-            resolverRef.current = null;
-            w.postMessage('stop');
-            reject(new Error('Stockfish timed out'));
-          }
+          if (activeCallbackRef.current === handler) activeCallbackRef.current = null;
+          w.postMessage('stop');
+          reject(new Error('Stockfish timed out'));
         }, 30_000);
 
-        // Wrap resolve to also clear the timer
-        const originalResolver = resolve;
-        resolverRef.current = (move: string) => {
-          clearTimeout(timer);
-          originalResolver(move);
+        const handler = (msg: string): boolean => {
+          if (msg.startsWith('bestmove')) {
+            clearTimeout(timer);
+            activeCallbackRef.current = null;
+            const move = msg.split(' ')[1] ?? '';
+            if (move && move !== '(none)') resolve(move);
+            else reject(new Error('Engine returned no move'));
+            return true;
+          }
+          return false;
         };
+
+        activeCallbackRef.current = handler;
+        w.postMessage(`position fen ${fen}`);
+        w.postMessage(`go depth ${depth}`);
       });
     },
-    [configure]
+    [configure, stopAndWait],
   );
 
-  const analyzePosition = useCallback(
-    (fen: string, depth = 10): Promise<{ score: number; bestMove: string; pv: string[] }> => {
-      return new Promise((resolve) => {
-        const w = workerRef.current;
-        if (!w) {
-          resolve({ score: 0, bestMove: '', pv: [] });
-          return;
-        }
+  // ─── analyzePosition ─────────────────────────────────────────────────────
 
+  const analyzePosition = useCallback(
+    async (
+      fen: string,
+      depth = 8,
+    ): Promise<{ score: number; bestMove: string; pv: string[] }> => {
+      const w = workerRef.current;
+      if (!w) return { score: 0, bestMove: '', pv: [] };
+
+      await stopAndWait();
+
+      return new Promise((resolve) => {
         let bestScore = 0;
         let bestMoveStr = '';
         let pvLine: string[] = [];
-        let done = false;
-        let searchStarted = false;
-        let finishTimer: ReturnType<typeof setTimeout>;
 
-        const finish = (result: { score: number; bestMove: string; pv: string[] }) => {
-          if (done) return;
-          done = true;
-          clearTimeout(finishTimer);
-          clearTimeout(stopFallback);
-          w.removeEventListener('message', handler);
-          resolve(result);
+        const finish = (bm: string) => {
+          clearTimeout(timer);
+          if (activeCallbackRef.current === handler) activeCallbackRef.current = null;
+          resolve({ score: bestScore, bestMove: bm, pv: pvLine });
         };
 
-        const startSearch = () => {
-          searchStarted = true;
-          w.postMessage(`position fen ${fen}`);
-          w.postMessage(`go depth ${depth}`);
-          // If search takes too long, stop it so the worker is freed for the next call
-          finishTimer = setTimeout(() => {
-            w.postMessage('stop');
-            finish({ score: bestScore, bestMove: bestMoveStr, pv: pvLine });
-          }, 15_000);
-        };
-
-        // If the engine was idle, stop produces no bestmove — start after 100ms anyway
-        const stopFallback = setTimeout(() => {
-          if (!searchStarted) startSearch();
-        }, 100);
-
-        const handler = (e: MessageEvent) => {
-          const msg = typeof e.data === 'string' ? e.data : '';
-          if (done) return;
-
-          if (!searchStarted) {
-            // Waiting for stop-response from any prior search
+        // Safety net: if search runs long, force-stop and take best result so far
+        const timer = setTimeout(() => {
+          if (activeCallbackRef.current !== handler) return;
+          // Replace our handler with a one-shot drain so the upcoming bestmove
+          // from the stop command is handled cleanly
+          activeCallbackRef.current = (msg: string): boolean => {
             if (msg.startsWith('bestmove')) {
-              clearTimeout(stopFallback);
-              startSearch();
+              activeCallbackRef.current = null;
+              const bm = msg.split(' ')[1] ?? '';
+              resolve({ score: bestScore, bestMove: bm || bestMoveStr, pv: pvLine });
+              return true;
             }
-            return;
-          }
+            return false;
+          };
+          w.postMessage('stop');
+        }, 12_000);
 
-          if (msg.startsWith('info depth')) {
-            const scoreMatch = msg.match(/score cp (-?\d+)/);
-            const mateMatch = msg.match(/score mate (-?\d+)/);
-            const pvMatch = msg.match(/ pv (.+)/);
-            if (scoreMatch) bestScore = parseInt(scoreMatch[1]);
-            if (mateMatch) bestScore = parseInt(mateMatch[1]) > 0 ? 30000 : -30000;
-            if (pvMatch) pvLine = pvMatch[1].split(' ');
+        const handler = (msg: string): boolean => {
+          if (msg.startsWith('info')) {
+            const scp  = msg.match(/score cp (-?\d+)/);
+            const smate = msg.match(/score mate (-?\d+)/);
+            const pv   = msg.match(/ pv (.+)/);
+            if (scp)   bestScore = parseInt(scp[1]);
+            if (smate) bestScore = parseInt(smate[1]) > 0 ? 30_000 : -30_000;
+            if (pv)    pvLine = pv[1].split(' ');
+            return true;
           }
-
           if (msg.startsWith('bestmove')) {
             bestMoveStr = msg.split(' ')[1] ?? '';
-            finish({ score: bestScore, bestMove: bestMoveStr, pv: pvLine });
+            finish(bestMoveStr);
+            return true;
           }
+          return false;
         };
 
-        console.log('[useStockfish] analyzePosition called, fen:', fen.slice(0, 40), 'depth:', depth);
-        // Register handler first, then stop any running search.
-        // Handler waits for the stop-response before starting our search.
-        w.addEventListener('message', handler);
-        w.postMessage('stop');
+        activeCallbackRef.current = handler;
+        w.postMessage(`position fen ${fen}`);
+        w.postMessage(`go depth ${depth}`);
       });
     },
-    []
+    [stopAndWait],
   );
 
   return { ready, getBestMove, analyzePosition, configure };
