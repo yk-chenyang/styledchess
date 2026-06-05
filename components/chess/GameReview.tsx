@@ -73,29 +73,41 @@ export default function GameReview({ pgn }: Props) {
   // ─── Parse PGN into FEN history immediately ────────────────────────────────
 
   useEffect(() => {
-    if (!pgn) return;
+    if (!pgn || pgn.trim() === '') return;
     try {
-      const game = new Chess();
-      game.loadPgn(pgn);
-      const history = game.history({ verbose: true });
+      // Load into chess.js to get validated SAN history
+      const loader = new Chess();
+      loader.loadPgn(pgn);
+      const sanHistory = loader.history(); // plain SAN strings
 
-      const fens: string[] = [];
+      // Respect a non-standard starting FEN (e.g. Chess960, loaded mid-game)
+      const headers = loader.header() as Record<string, string>;
+      const startFen: string = headers['FEN'] ??
+        'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+
+      // Replay from scratch using SAN — this always works regardless of PGN headers
+      const replay = new Chess(startFen);
+      const fens: string[] = [replay.fen()];
       const parsedMoves: ParsedMove[] = [];
-      const replay = new Chess();
-      fens.push(replay.fen());
 
-      for (const m of history) {
+      for (const san of sanHistory) {
         try {
-          const result = replay.move({ from: m.from, to: m.to, promotion: m.promotion });
-          if (!result) break;
+          const m = replay.move(san);
+          if (!m) break;
           fens.push(replay.fen());
-          parsedMoves.push({ san: m.san, from: m.from, to: m.to, color: m.color as 'w' | 'b', promotion: m.promotion });
+          parsedMoves.push({
+            san: m.san,
+            from: m.from,
+            to: m.to,
+            color: m.color as 'w' | 'b',
+            promotion: m.promotion,
+          });
         } catch { break; }
       }
 
       setFenHistory(fens);
       setMoves(parsedMoves);
-      setViewIndex(fens.length - 1); // start at the final position
+      setViewIndex(fens.length - 1); // show final position
       setResults(new Map());
       setAnalyzeError('');
     } catch (e) {
@@ -142,12 +154,8 @@ export default function GameReview({ pgn }: Props) {
         const fenAfter  = fenHistory[i + 1];
         if (!fenBefore || !fenAfter) continue;
 
-        const [before, after] = await Promise.all([
-          // Can't be truly parallel (same engine), so run sequentially
-          stockfish.analyzePosition(fenBefore, 8),
-          Promise.resolve(null), // placeholder
-        ]);
-        const afterResult = await stockfish.analyzePosition(fenAfter, 8);
+        const before      = await stockfish.analyzePosition(fenBefore, 8);
+        const afterResult = await stockfish.analyzePosition(fenAfter,  8);
 
         const move = moves[i];
         // CP from moving side's perspective

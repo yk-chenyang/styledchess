@@ -58,6 +58,9 @@ export default function ChessBoard({ botId, userColor, guestToken, stockfishConf
   const stockfish = useStockfish();
   const botRequestedRef = useRef(false);
 
+  // Single Chess instance that accumulates every move — gives us a valid full PGN
+  const masterGameRef = useRef(new Chess());
+
   const isAtLatest = viewIndex === fenHistory.length - 1;
 
   // --- Apply a completed move to all state ---
@@ -75,12 +78,18 @@ export default function ChessBoard({ botId, userColor, guestToken, stockfishConf
     setGame(newGame);
     setAnnotatedMoves(prev => [...prev, { san: moveResult.san, color: moveResult.color, from, to }]);
 
+    // Keep masterGame in sync — this is the only Chess instance with complete history
+    try {
+      masterGameRef.current.move({ from, to, promotion: moveResult.promotion });
+    } catch {}
+
     const over = getGameOver(newGame);
     if (over) {
       setStatus('gameover');
       setGameResult(over.result);
       setGameResultReason(over.reason);
-      onGameEnd?.(newGame.pgn(), over.result, userColor);
+      // masterGame.pgn() contains the full move history from move 1
+      onGameEnd?.(masterGameRef.current.pgn(), over.result, userColor);
     }
   }, [onGameEnd, userColor]);
 
@@ -209,11 +218,12 @@ export default function ChessBoard({ botId, userColor, guestToken, stockfishConf
     setStatus('gameover');
     setGameResult(result);
     setGameResultReason('Resignation');
-    onGameEnd?.(game.pgn(), result, userColor);
-  }, [userColor, game, onGameEnd]);
+    onGameEnd?.(masterGameRef.current.pgn(), result, userColor);
+  }, [userColor, onGameEnd]);
 
   const resetGame = useCallback(() => {
     const fresh = new Chess();
+    masterGameRef.current = new Chess(); // reset full-history tracker
     setGame(fresh);
     setFenHistory([fresh.fen()]);
     fenHistoryRef.current = [fresh.fen()];
