@@ -20,7 +20,8 @@ type Annotation =
 
 interface MoveResult {
   annotation: Annotation;
-  cpLoss: number;
+  wpl: number;      // win-probability loss % (used for classification & accuracy)
+  cpLoss: number;   // raw centipawn loss (shown in detail panel)
   bestMove: string;
 }
 
@@ -55,34 +56,82 @@ const ANNOT: Record<Annotation, {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /**
- * Correct cpLoss for BOTH colors:
- *   analyzePosition returns score from side-to-move's perspective.
- *   After the move the side-to-move flips, so white's perspective on
- *   the "after" position is  -afterScore.
- *   cpLoss = max(0, beforeScore + afterScore)  works for both w and b.
+ * Win probability for the side with `cp` centipawn advantage (0–100 %).
+ * Uses the same sigmoid coefficient chess.com's engine pipeline uses.
+ */
+function cpToWinPct(cp: number): number {
+  return 100 / (1 + Math.exp(-0.003682 * cp));
+}
+
+/**
+ * Win-probability loss (WPL) for the side that just moved, in percentage points.
+ *
+ * Both parameters come straight from analyzePosition():
+ *   beforeScore  – eval from the MOVING side's perspective (positive = they're winning)
+ *   afterScore   – eval from the OPPONENT's perspective after the move (positive = opponent winning)
+ *
+ * Because the side-to-move flips after the move, the moving side's win %
+ * after the move is cpToWinPct(-afterScore).
+ *
+ * The same formula works for both white and black.
+ * Positive WPL = lost win probability (bad move).
+ * Negative WPL = gained win probability (great / brilliant move).
+ */
+function computeWPL(beforeScore: number, afterScore: number): number {
+  return cpToWinPct(beforeScore) - cpToWinPct(-afterScore);
+}
+
+/**
+ * Raw centipawn loss (for display only – NOT used for classification).
+ * Same symmetry trick: max(0, beforeScore + afterScore).
  */
 function computeCpLoss(beforeScore: number, afterScore: number): number {
   return Math.max(0, beforeScore + afterScore);
 }
 
-function cpLossToAnnotation(cpLoss: number, isBestMove: boolean): Annotation {
-  if (isBestMove && cpLoss <= 5) return 'best';
-  if (cpLoss <= 5)   return 'great';
-  if (cpLoss <= 15)  return 'excellent';
-  if (cpLoss <= 35)  return 'good';
-  if (cpLoss <= 100) return 'inaccuracy';
-  if (cpLoss <= 250) return 'mistake';
+/**
+ * Classify a move using WPL thresholds that mirror chess.com's intent.
+ *
+ * Key design decisions:
+ *  • WPL is context-aware: losing 200 cp when up +700 is far less damaging
+ *    than losing 200 cp from an equal position.
+ *  • "Great" requires essentially zero WPL AND a different move from the
+ *    engine's top choice – this keeps it genuinely rare.
+ *  • "Brilliant" requires a negative WPL (you actually gained win probability)
+ *    AND you didn't play the engine's top suggestion.
+ *  • "Blunder" threshold (WPL > 16 %) ≈ losing a full pawn (~100 cp) from
+ *    an equal position.
+ *
+ * Approximate WPL ↔ cp-from-equal equivalents:
+ *   0.5 % WPL ≈   2 cp   (noise floor at depth 8)
+ *   2   % WPL ≈   9 cp   (tiny imprecision)
+ *   5   % WPL ≈  23 cp   (slight edge loss)
+ *   8   % WPL ≈  40 cp   (real inaccuracy)
+ *   16  % WPL ≈  90 cp   (≈ pawn from equal)
+ *    > 16 %     > 90 cp  (significant blunder)
+ */
+function classifyMove(wpl: number, isBestMove: boolean): Annotation {
+  // Gained win probability AND different from engine's top → Brilliant
+  if (wpl <= -2.0 && !isBestMove) return 'brilliant';
+  // Matched engine's top choice with minimal loss
+  if (isBestMove && wpl <= 0.5)  return 'best';
+  // Different move but essentially no win-probability cost (very rare)
+  if (!isBestMove && wpl <= 0.5) return 'great';
+  if (wpl <=  2.0)               return 'excellent';
+  if (wpl <=  5.0)               return 'good';
+  if (wpl <=  8.0)               return 'inaccuracy';
+  if (wpl <= 16.0)               return 'mistake';
   return 'blunder';
 }
 
-/** chess.com accuracy formula */
-function cpToAccuracy(cpLoss: number): number {
-  return Math.max(0, Math.min(100, 103.1668 * Math.exp(-0.04354 * cpLoss) - 3.1668));
-}
-
-/** Convert centipawns (from white's perspective) → win % for white (0–100) */
-function cpToWinPct(cp: number): number {
-  return 100 / (1 + Math.exp(-0.003682 * cp));
+/**
+ * Per-move accuracy (0–100 %) using chess.com's formula applied to WPL.
+ * Negative WPL (improved position) clamps to 100 %.
+ */
+function wplToAccuracy(wpl: number): number {
+  return Math.max(0, Math.min(100,
+    103.1668 * Math.exp(-0.04354 * Math.max(0, wpl)) - 3.1668,
+  ));
 }
 
 // ─── EvalGraph ───────────────────────────────────────────────────────────────
@@ -326,15 +375,15 @@ export default function GameReview({ pgn }: Props) {
         posScoresRef.current[i + 1] = whiteCpAfter;
         setPosScores([...posScoresRef.current]);
 
-        // cpLoss = max(0, beforeScore + afterScore)  — correct for both colors.
-        // (beforeScore = from side-to-move's perspective; afterScore = from the
-        //  opposite side's perspective; adding them gives the moving side's net loss.)
-        const cpLoss   = computeCpLoss(before.score, afterResult.score);
-        const playedUci = moves[i].from + moves[i].to;
+        // Win-probability loss drives classification (context-aware, mirrors chess.com).
+        // Raw cpLoss is kept for the detail panel display only.
+        const wpl        = computeWPL(before.score, afterResult.score);
+        const cpLoss     = computeCpLoss(before.score, afterResult.score);
+        const playedUci  = moves[i].from + moves[i].to;
         const isBestMove = before.bestMove.slice(0, 4) === playedUci;
-        const annotation = cpLossToAnnotation(cpLoss, isBestMove);
+        const annotation = classifyMove(wpl, isBestMove);
 
-        newResults.set(i, { annotation, cpLoss, bestMove: before.bestMove });
+        newResults.set(i, { annotation, wpl, cpLoss, bestMove: before.bestMove });
         setResults(new Map(newResults));
       } catch {
         // skip on error
@@ -391,7 +440,7 @@ export default function GameReview({ pgn }: Props) {
   const { whiteAcc, blackAcc } = useMemo(() => {
     const w: number[] = [], b: number[] = [];
     results.forEach((r, i) => {
-      (moves[i]?.color === 'w' ? w : b).push(cpToAccuracy(r.cpLoss));
+      (moves[i]?.color === 'w' ? w : b).push(wplToAccuracy(r.wpl));
     });
     const avg = (a: number[]) => a.length ? Math.round(a.reduce((s, v) => s + v, 0) / a.length) : null;
     return { whiteAcc: avg(w), blackAcc: avg(b) };
@@ -474,9 +523,10 @@ export default function GameReview({ pgn }: Props) {
                   </span>
                 )}
               </div>
-              {viewResult && viewResult.cpLoss > 5 && (
+              {viewResult && viewResult.wpl > 0.5 && (
                 <p className="text-chess-text-secondary mt-1 text-xs">
-                  −{viewResult.cpLoss} cp
+                  −{viewResult.wpl.toFixed(1)} % win probability
+                  {viewResult.cpLoss > 0 && <> · −{viewResult.cpLoss} cp</>}
                   {(viewResult.bestMove?.length ?? 0) >= 4 && (
                     <> · Best: <code className="font-mono" style={{ color: ANNOT.best.color }}>
                       {viewResult.bestMove!.slice(0, 2)}→{viewResult.bestMove!.slice(2, 4)}
