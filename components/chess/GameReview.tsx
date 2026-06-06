@@ -7,13 +7,21 @@ import { useStockfish } from '@/hooks/useStockfish';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type Annotation = 'brilliant' | 'best' | 'excellent' | 'good' | 'inaccuracy' | 'mistake' | 'blunder';
+// Ordered worst → best (matches chess.com category order)
+type Annotation =
+  | 'blunder'     // ?? red
+  | 'mistake'     // ?  orange
+  | 'inaccuracy'  // ?! yellow
+  | 'good'        //    green-grey (no symbol)
+  | 'excellent'   //    light green (no symbol)
+  | 'best'        // ✓  green  (matched engine's top move)
+  | 'great'       // !  blue   (very close but different from engine's top)
+  | 'brilliant';  // !! teal   (impressive sacrifice / improvement)
 
 interface MoveResult {
   annotation: Annotation;
   cpLoss: number;
-  bestMove: string;  // UCI best move for the position BEFORE this move
-  scoreBefore: number;
+  bestMove: string;
 }
 
 interface ParsedMove {
@@ -24,68 +32,219 @@ interface ParsedMove {
   promotion?: string;
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Annotation config (colors matching chess.com) ───────────────────────────
 
-function cpLossToAnnotation(cpLoss: number): Annotation {
-  if (cpLoss <= 5)   return 'best';
-  if (cpLoss <= 20)  return 'excellent';
-  if (cpLoss <= 50)  return 'good';
+const ANNOT: Record<Annotation, {
+  label: string;
+  symbol: string;
+  color: string;        // text / accent
+  arrowColor: string;   // played-move arrow
+  bg: string;           // detail-panel tailwind
+  graphDot: string | null;  // dot on graph (null = don't show)
+}> = {
+  brilliant:  { label:'Brilliant',  symbol:'!!', color:'#1baca6', arrowColor:'rgba(27,172,166,0.85)',  bg:'bg-teal-900/40 border-teal-500',     graphDot:'#1baca6' },
+  great:      { label:'Great',      symbol:'!',  color:'#5882cd', arrowColor:'rgba(88,130,205,0.85)',  bg:'bg-blue-900/30 border-blue-500',     graphDot:'#5882cd' },
+  best:       { label:'Best',       symbol:'✓',  color:'#769656', arrowColor:'rgba(118,150,86,0.85)', bg:'bg-green-900/30 border-green-600',   graphDot:null },
+  excellent:  { label:'Excellent',  symbol:'',   color:'#96c44a', arrowColor:'rgba(150,196,74,0.8)',  bg:'bg-lime-900/20 border-lime-700',     graphDot:null },
+  good:       { label:'Good',       symbol:'',   color:'#7a9e5f', arrowColor:'rgba(122,158,95,0.7)',  bg:'bg-green-900/10 border-green-900',   graphDot:null },
+  inaccuracy: { label:'Inaccuracy', symbol:'?!', color:'#e8c94c', arrowColor:'rgba(232,201,76,0.85)', bg:'bg-yellow-900/30 border-yellow-600', graphDot:'#e8c94c' },
+  mistake:    { label:'Mistake',    symbol:'?',  color:'#e67e22', arrowColor:'rgba(230,126,34,0.85)', bg:'bg-orange-900/30 border-orange-600', graphDot:'#e67e22' },
+  blunder:    { label:'Blunder',    symbol:'??', color:'#e74c3c', arrowColor:'rgba(231,76,60,0.85)',  bg:'bg-red-900/30 border-red-600',       graphDot:'#e74c3c' },
+};
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Correct cpLoss for BOTH colors:
+ *   analyzePosition returns score from side-to-move's perspective.
+ *   After the move the side-to-move flips, so white's perspective on
+ *   the "after" position is  -afterScore.
+ *   cpLoss = max(0, beforeScore + afterScore)  works for both w and b.
+ */
+function computeCpLoss(beforeScore: number, afterScore: number): number {
+  return Math.max(0, beforeScore + afterScore);
+}
+
+function cpLossToAnnotation(cpLoss: number, isBestMove: boolean): Annotation {
+  if (isBestMove && cpLoss <= 5) return 'best';
+  if (cpLoss <= 5)   return 'great';
+  if (cpLoss <= 15)  return 'excellent';
+  if (cpLoss <= 35)  return 'good';
   if (cpLoss <= 100) return 'inaccuracy';
-  if (cpLoss <= 200) return 'mistake';
+  if (cpLoss <= 250) return 'mistake';
   return 'blunder';
 }
 
-/** chess.com accuracy formula: 103.1668 * e^(-0.04354 * cpLoss) - 3.1668 */
-function cpLossToAccuracy(cpLoss: number): number {
+/** chess.com accuracy formula */
+function cpToAccuracy(cpLoss: number): number {
   return Math.max(0, Math.min(100, 103.1668 * Math.exp(-0.04354 * cpLoss) - 3.1668));
 }
 
-const ANNOT_CFG: Record<Annotation, { label: string; symbol: string; color: string; arrowColor: string; bg: string }> = {
-  brilliant:  { label: 'Brilliant',  symbol: '!!', color: '#1baca6', arrowColor: 'rgba(27,172,166,0.85)',  bg: 'bg-teal-900/40 border-teal-500' },
-  best:       { label: 'Best',       symbol: '✓',  color: '#769656', arrowColor: 'rgba(118,150,86,0.85)', bg: 'bg-green-900/30 border-green-600' },
-  excellent:  { label: 'Excellent',  symbol: '!',  color: '#4a9eff', arrowColor: 'rgba(74,158,255,0.85)', bg: 'bg-blue-900/30 border-blue-500' },
-  good:       { label: 'Good',       symbol: '',   color: '#a0b090', arrowColor: 'rgba(160,176,144,0.7)', bg: 'bg-green-900/10 border-green-800' },
-  inaccuracy: { label: 'Inaccuracy', symbol: '?!', color: '#eab308', arrowColor: 'rgba(234,179,8,0.85)',  bg: 'bg-yellow-900/30 border-yellow-600' },
-  mistake:    { label: 'Mistake',    symbol: '?',  color: '#f97316', arrowColor: 'rgba(249,115,22,0.85)', bg: 'bg-orange-900/30 border-orange-600' },
-  blunder:    { label: 'Blunder',    symbol: '??', color: '#ef4444', arrowColor: 'rgba(239,68,68,0.85)',  bg: 'bg-red-900/30 border-red-600' },
-};
+/** Convert centipawns (from white's perspective) → win % for white (0–100) */
+function cpToWinPct(cp: number): number {
+  return 100 / (1 + Math.exp(-0.003682 * cp));
+}
 
-// ─── Component ────────────────────────────────────────────────────────────────
+// ─── EvalGraph ───────────────────────────────────────────────────────────────
+
+const GRAPH_H = 76;
+
+function EvalGraph({
+  scores,
+  results,
+  viewIndex,
+  onNavigate,
+}: {
+  scores: (number | null)[];
+  results: Map<number, MoveResult>;
+  viewIndex: number;
+  onNavigate: (idx: number) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [W, setW] = useState(480);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(([e]) => setW(e.contentRect.width));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const n = scores.length;
+  const hasData = scores.some(s => s !== null);
+
+  // Convert white-perspective cp → Y pixel (top = white winning max, bottom = black winning max)
+  const toY = (cp: number | null) => {
+    const pct = cpToWinPct(cp ?? 0); // 0–100, 50 = equal
+    // pct=100 → y=2 (top, white winning)
+    // pct=50  → y=GRAPH_H/2 (middle)
+    // pct=0   → y=GRAPH_H-2 (bottom, black winning)
+    return 2 + ((100 - pct) / 100) * (GRAPH_H - 4);
+  };
+
+  const midY = toY(0); // ≈ GRAPH_H/2
+
+  const xAt = (i: number) =>
+    n <= 1 ? W / 2 : (i / (n - 1)) * W;
+
+  // Build SVG path of the evaluation curve
+  const pts = scores.map((s, i) => [xAt(i), toY(s)] as [number, number]);
+
+  const curvePath = pts.length < 2
+    ? ''
+    : pts.map(([x, y], i) => `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
+
+  // White-territory fill: from the curve DOWN to the bottom edge
+  const whiteFill = pts.length < 2
+    ? ''
+    : [
+        `M${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`,
+        ...pts.slice(1).map(([x, y]) => `L${x.toFixed(1)},${y.toFixed(1)}`),
+        `L${pts[n - 1][0].toFixed(1)},${GRAPH_H}`,
+        `L${pts[0][0].toFixed(1)},${GRAPH_H}`,
+        'Z',
+      ].join(' ');
+
+  // Dots for notable moves (inaccuracy / mistake / blunder / great / brilliant)
+  const dots = Array.from(results.entries())
+    .filter(([, r]) => ANNOT[r.annotation].graphDot !== null)
+    .map(([i, r]) => {
+      const posIdx = i + 1; // result[i] describes move i, leading to position i+1
+      return { x: xAt(posIdx), y: toY(scores[posIdx] ?? null), color: ANNOT[r.annotation].graphDot! };
+    });
+
+  // Indicator for current position
+  const indX = viewIndex >= 0 && viewIndex < n ? xAt(viewIndex) : null;
+  const indY = indX !== null ? toY(scores[viewIndex] ?? null) : null;
+
+  const handleClick = (e: React.MouseEvent<SVGSVGElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const rel = (e.clientX - rect.left) / rect.width;
+    onNavigate(Math.round(rel * (n - 1)));
+  };
+
+  return (
+    <div
+      ref={containerRef}
+      className="w-full rounded-lg overflow-hidden border border-chess-border"
+      style={{ height: GRAPH_H, background: '#1a1a2a' }}
+    >
+      <svg width={W} height={GRAPH_H} className="block cursor-pointer" onClick={handleClick}>
+        {/* Dark background */}
+        <rect x={0} y={0} width={W} height={GRAPH_H} fill="#1a1a2a" />
+
+        {hasData && (
+          <>
+            {/* White territory (below curve = white winning) */}
+            <path d={whiteFill} fill="rgba(230,230,230,0.90)" />
+
+            {/* Midline */}
+            <line x1={0} y1={midY} x2={W} y2={midY}
+              stroke="rgba(160,160,160,0.2)" strokeWidth="1" />
+
+            {/* Evaluation curve */}
+            <path d={curvePath} fill="none"
+              stroke="rgba(200,200,200,0.55)" strokeWidth="1.5" />
+
+            {/* Annotation dots on the curve */}
+            {dots.map((d, k) => (
+              <circle key={k} cx={d.x} cy={d.y} r={4}
+                fill={d.color} stroke="rgba(0,0,0,0.5)" strokeWidth={1} />
+            ))}
+          </>
+        )}
+
+        {/* Current-position indicator */}
+        {indX !== null && (
+          <>
+            <line x1={indX} y1={0} x2={indX} y2={GRAPH_H}
+              stroke="rgba(255,255,255,0.6)" strokeWidth="1.5" />
+            {indY !== null && (
+              <circle cx={indX} cy={indY} r={5}
+                fill="white" stroke="rgba(0,0,0,0.45)" strokeWidth={1.5} />
+            )}
+          </>
+        )}
+      </svg>
+    </div>
+  );
+}
+
+// ─── Main component ───────────────────────────────────────────────────────────
 
 interface Props { pgn: string }
 
 export default function GameReview({ pgn }: Props) {
-  // Parsed game data (populated immediately from PGN)
   const [fenHistory, setFenHistory] = useState<string[]>([]);
   const [moves, setMoves]           = useState<ParsedMove[]>([]);
   const [viewIndex, setViewIndex]   = useState(0);
 
-  // Analysis results (populated asynchronously)
-  const [results, setResults]     = useState<Map<number, MoveResult>>(new Map());
-  const [analyzing, setAnalyzing] = useState(false);
-  const [progress, setProgress]   = useState(0);
+  const [results, setResults]           = useState<Map<number, MoveResult>>(new Map());
+  /** White-perspective centipawn score for each position (index = viewIndex). */
+  const [posScores, setPosScores]       = useState<(number | null)[]>([]);
+  const posScoresRef                    = useRef<(number | null)[]>([]);
+
+  const [analyzing, setAnalyzing]       = useState(false);
+  const [progress, setProgress]         = useState(0);
   const [analyzeError, setAnalyzeError] = useState('');
 
-  const stockfish = useStockfish();
-  const moveListRef = useRef<HTMLDivElement>(null);
-  const analyzingRef = useRef(false); // guard against double-click
+  const stockfish    = useStockfish();
+  const moveListRef  = useRef<HTMLDivElement>(null);
+  const analyzingRef = useRef(false);
 
-  // ─── Parse PGN into FEN history immediately ────────────────────────────────
+  // ─── Parse PGN immediately ────────────────────────────────────────────────
 
   useEffect(() => {
-    if (!pgn || pgn.trim() === '') return;
+    if (!pgn?.trim()) return;
     try {
-      // Load into chess.js to get validated SAN history
       const loader = new Chess();
       loader.loadPgn(pgn);
-      const sanHistory = loader.history(); // plain SAN strings
-
-      // Respect a non-standard starting FEN (e.g. Chess960, loaded mid-game)
+      const sanHistory = loader.history();
       const headers = loader.header() as Record<string, string>;
-      const startFen: string = headers['FEN'] ??
+      const startFen = headers['FEN'] ??
         'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 
-      // Replay from scratch using SAN — this always works regardless of PGN headers
       const replay = new Chess(startFen);
       const fens: string[] = [replay.fen()];
       const parsedMoves: ParsedMove[] = [];
@@ -95,20 +254,17 @@ export default function GameReview({ pgn }: Props) {
           const m = replay.move(san);
           if (!m) break;
           fens.push(replay.fen());
-          parsedMoves.push({
-            san: m.san,
-            from: m.from,
-            to: m.to,
-            color: m.color as 'w' | 'b',
-            promotion: m.promotion,
-          });
+          parsedMoves.push({ san: m.san, from: m.from, to: m.to,
+            color: m.color as 'w' | 'b', promotion: m.promotion });
         } catch { break; }
       }
 
       setFenHistory(fens);
       setMoves(parsedMoves);
-      setViewIndex(fens.length - 1); // show final position
+      setViewIndex(fens.length - 1);
       setResults(new Map());
+      setPosScores(new Array(fens.length).fill(null));
+      posScoresRef.current = new Array(fens.length).fill(null);
       setAnalyzeError('');
     } catch (e) {
       console.error('[GameReview] PGN parse error:', e);
@@ -119,80 +275,90 @@ export default function GameReview({ pgn }: Props) {
   // ─── Scroll active move into view ─────────────────────────────────────────
 
   useEffect(() => {
-    const el = moveListRef.current?.querySelector('[data-active="true"]');
-    el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    moveListRef.current
+      ?.querySelector('[data-active="true"]')
+      ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }, [viewIndex]);
 
   // ─── Keyboard navigation ──────────────────────────────────────────────────
 
   useEffect(() => {
-    const handleKey = (e: KeyboardEvent) => {
+    const handle = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       if (e.key === 'ArrowLeft')  setViewIndex(i => Math.max(0, i - 1));
       if (e.key === 'ArrowRight') setViewIndex(i => Math.min(fenHistory.length - 1, i + 1));
     };
-    window.addEventListener('keydown', handleKey);
-    return () => window.removeEventListener('keydown', handleKey);
+    window.addEventListener('keydown', handle);
+    return () => window.removeEventListener('keydown', handle);
   }, [fenHistory.length]);
 
-  // ─── Async analysis ───────────────────────────────────────────────────────
+  // ─── Analysis ─────────────────────────────────────────────────────────────
 
   const analyze = useCallback(async () => {
     if (!stockfish.ready || analyzingRef.current || moves.length === 0) return;
     analyzingRef.current = true;
     setAnalyzing(true);
     setResults(new Map());
+    setPosScores(new Array(fenHistory.length).fill(null));
+    posScoresRef.current = new Array(fenHistory.length).fill(null);
     setAnalyzeError('');
 
     const newResults = new Map<number, MoveResult>();
 
     for (let i = 0; i < moves.length; i++) {
       setProgress(Math.round(((i + 1) / moves.length) * 100));
+      const fenBefore = fenHistory[i];
+      const fenAfter  = fenHistory[i + 1];
+      if (!fenBefore || !fenAfter) continue;
 
       try {
-        const fenBefore = fenHistory[i];
-        const fenAfter  = fenHistory[i + 1];
-        if (!fenBefore || !fenAfter) continue;
-
         const before      = await stockfish.analyzePosition(fenBefore, 8);
         const afterResult = await stockfish.analyzePosition(fenAfter,  8);
 
-        const move = moves[i];
-        // CP from moving side's perspective
-        const cpBefore = move.color === 'w' ? before.score  : -before.score;
-        const cpAfter  = move.color === 'w' ? -afterResult.score : afterResult.score;
-        const cpLoss   = Math.max(0, cpBefore - cpAfter);
+        // White-perspective scores for the evaluation graph
+        // FEN second field is the side to move ('w' or 'b')
+        const turnBefore = fenBefore.split(' ')[1];
+        const turnAfter  = fenAfter.split(' ')[1];
+        const whiteCpBefore = turnBefore === 'w' ?  before.score : -before.score;
+        const whiteCpAfter  = turnAfter  === 'w' ? afterResult.score : -afterResult.score;
 
-        const annotation = cpLossToAnnotation(cpLoss);
+        posScoresRef.current[i]     = whiteCpBefore;
+        posScoresRef.current[i + 1] = whiteCpAfter;
+        setPosScores([...posScoresRef.current]);
 
-        newResults.set(i, { annotation, cpLoss, bestMove: before.bestMove, scoreBefore: before.score });
-        // Live update — spread so React sees a new Map reference
+        // cpLoss = max(0, beforeScore + afterScore)  — correct for both colors.
+        // (beforeScore = from side-to-move's perspective; afterScore = from the
+        //  opposite side's perspective; adding them gives the moving side's net loss.)
+        const cpLoss   = computeCpLoss(before.score, afterResult.score);
+        const playedUci = moves[i].from + moves[i].to;
+        const isBestMove = before.bestMove.slice(0, 4) === playedUci;
+        const annotation = cpLossToAnnotation(cpLoss, isBestMove);
+
+        newResults.set(i, { annotation, cpLoss, bestMove: before.bestMove });
         setResults(new Map(newResults));
       } catch {
-        // skip this move on error
+        // skip on error
       }
     }
 
-    if (newResults.size === 0) {
-      setAnalyzeError('Analysis failed. The engine may not be ready — wait a moment and try again.');
-    }
+    if (newResults.size === 0)
+      setAnalyzeError('Analysis produced no results. Try again in a moment.');
 
     setAnalyzing(false);
     setProgress(0);
     analyzingRef.current = false;
   }, [stockfish, moves, fenHistory]);
 
-  // ─── Derived display values ───────────────────────────────────────────────
+  // ─── Derived values ───────────────────────────────────────────────────────
 
   const displayFen = fenHistory[viewIndex] ?? 'start';
-  const viewMove   = moves[viewIndex - 1];   // move that led to current position
-  const viewResult = results.get(viewIndex - 1); // analysis of that move
+  const viewMove   = moves[viewIndex - 1];
+  const viewResult = results.get(viewIndex - 1);
 
-  // Highlight squares
   const highlightSquares = useMemo(() => {
     const sq: Record<string, React.CSSProperties> = {};
     if (viewMove) {
-      sq[viewMove.from] = { background: 'rgba(118,150,86,0.35)' };
+      sq[viewMove.from] = { background: 'rgba(118,150,86,0.30)' };
       sq[viewMove.to]   = { background: 'rgba(118,150,86,0.55)' };
     }
     try {
@@ -205,34 +371,29 @@ export default function GameReview({ pgn }: Props) {
     return sq;
   }, [viewMove, displayFen]);
 
-  // Arrows: played move (annotation color) + best move (green if different)
+  // Arrows: played move (colored by annotation) + engine's best (green) if different
   const arrows = useMemo((): [string, string, string][] => {
+    if (!viewMove) return [];
     const arr: [string, string, string][] = [];
-    if (!viewMove) return arr;
-
-    const annotColor = viewResult
-      ? ANNOT_CFG[viewResult.annotation].arrowColor
-      : 'rgba(118,150,86,0.7)';
-    arr.push([viewMove.from, viewMove.to, annotColor]);
-
-    if (viewResult?.bestMove && viewResult.bestMove.length >= 4) {
-      const bf = viewResult.bestMove.slice(0, 2);
-      const bt = viewResult.bestMove.slice(2, 4);
-      if (bf !== viewMove.from || bt !== viewMove.to) {
+    const ac = viewResult ? ANNOT[viewResult.annotation].arrowColor : 'rgba(118,150,86,0.7)';
+    arr.push([viewMove.from, viewMove.to, ac]);
+    const bm = viewResult?.bestMove ?? '';
+    if (bm.length >= 4) {
+      const bf = bm.slice(0, 2);
+      const bt = bm.slice(2, 4);
+      if (bf !== viewMove.from || bt !== viewMove.to)
         arr.push([bf, bt, 'rgba(0,200,120,0.9)']);
-      }
     }
     return arr;
   }, [viewMove, viewResult]);
 
-  // Accuracy stats
+  // Per-color accuracy
   const { whiteAcc, blackAcc } = useMemo(() => {
     const w: number[] = [], b: number[] = [];
     results.forEach((r, i) => {
-      const arr = moves[i]?.color === 'w' ? w : b;
-      arr.push(cpLossToAccuracy(r.cpLoss));
+      (moves[i]?.color === 'w' ? w : b).push(cpToAccuracy(r.cpLoss));
     });
-    const avg = (arr: number[]) => arr.length ? Math.round(arr.reduce((s, v) => s + v, 0) / arr.length) : null;
+    const avg = (a: number[]) => a.length ? Math.round(a.reduce((s, v) => s + v, 0) / a.length) : null;
     return { whiteAcc: avg(w), blackAcc: avg(b) };
   }, [results, moves]);
 
@@ -240,155 +401,150 @@ export default function GameReview({ pgn }: Props) {
 
   if (fenHistory.length === 0) {
     return (
-      <div className="text-chess-text-secondary text-sm py-4 text-center">
+      <div className="text-chess-text-secondary text-sm py-6 text-center">
         {analyzeError || 'No game data available.'}
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col lg:flex-row gap-6 items-start">
+    <div className="flex flex-col gap-4">
 
-      {/* ── Left: Board + nav ── */}
-      <div className="flex flex-col gap-3">
+      {/* ── Evaluation graph — full width ─────────────────────────── */}
+      <EvalGraph
+        scores={posScores}
+        results={results}
+        viewIndex={viewIndex}
+        onNavigate={setViewIndex}
+      />
 
-        {/* Accuracy bar */}
-        {(whiteAcc !== null || blackAcc !== null) && (
-          <div className="flex gap-6 bg-chess-bg-card border border-chess-border rounded-lg px-4 py-2 text-sm">
-            <AccBar label="White" pct={whiteAcc} />
-            <AccBar label="Black" pct={blackAcc} />
-          </div>
-        )}
+      {/* ── Board + move list ─────────────────────────────────────── */}
+      <div className="flex flex-col lg:flex-row gap-6 items-start">
 
-        {/* Board */}
-        <div className="rounded-lg overflow-hidden shadow-2xl">
-          <Chessboard
-            position={displayFen}
-            boardWidth={480}
-            arePiecesDraggable={false}
-            customSquareStyles={highlightSquares}
-            customArrows={arrows as any}
-            customBoardStyle={{ borderRadius: '4px' }}
-            customDarkSquareStyle={{ backgroundColor: '#b58863' }}
-            customLightSquareStyle={{ backgroundColor: '#f0d9b5' }}
-          />
-        </div>
+        {/* Left: board + accuracy + nav + detail */}
+        <div className="flex flex-col gap-3">
 
-        {/* Nav controls */}
-        <div className="flex items-center gap-1.5">
-          <NavBtn onClick={() => setViewIndex(0)} disabled={viewIndex === 0} title="Start">⏮</NavBtn>
-          <NavBtn onClick={() => setViewIndex(i => Math.max(0, i - 1))} disabled={viewIndex === 0} title="Prev (←)">◀</NavBtn>
-          <NavBtn onClick={() => setViewIndex(i => Math.min(fenHistory.length - 1, i + 1))} disabled={viewIndex === fenHistory.length - 1} title="Next (→)">▶</NavBtn>
-          <NavBtn onClick={() => setViewIndex(fenHistory.length - 1)} disabled={viewIndex === fenHistory.length - 1} title="End">⏭</NavBtn>
-          <span className="text-chess-text-secondary text-xs ml-1">
-            {viewIndex === 0 ? 'Start' : `Move ${viewIndex} / ${moves.length}`}
-          </span>
-        </div>
-
-        {/* Current move detail */}
-        {viewMove && (
-          <div className={`border rounded-lg px-4 py-3 text-sm ${viewResult ? ANNOT_CFG[viewResult.annotation].bg : 'bg-chess-bg-card border-chess-border'}`}>
-            <div className="flex items-center justify-between">
-              <span className="font-bold text-chess-text-primary text-base">
-                {Math.ceil(viewIndex / 2)}{viewMove.color === 'b' ? '…' : '.'} {viewMove.san}
-                {viewResult && ANNOT_CFG[viewResult.annotation].symbol && (
-                  <sup className="ml-1 text-sm">{ANNOT_CFG[viewResult.annotation].symbol}</sup>
-                )}
-              </span>
-              {viewResult && (
-                <span className="font-semibold text-sm" style={{ color: ANNOT_CFG[viewResult.annotation].color }}>
-                  {ANNOT_CFG[viewResult.annotation].label}
-                </span>
-              )}
+          {/* Accuracy bars (shown once analysis has results) */}
+          {(whiteAcc !== null || blackAcc !== null) && (
+            <div className="flex gap-8 bg-chess-bg-card border border-chess-border rounded-lg px-4 py-2.5">
+              <AccBar label="White" pct={whiteAcc} />
+              <AccBar label="Black" pct={blackAcc} />
             </div>
-            {viewResult && viewResult.cpLoss > 5 && (
-              <p className="text-chess-text-secondary mt-1">
-                −{viewResult.cpLoss} cp
-                {viewResult.bestMove && (
-                  <> · Best: <code className="text-chess-green font-mono">{viewResult.bestMove.slice(0,2)}→{viewResult.bestMove.slice(2,4)}</code></>
-                )}
-              </p>
-            )}
-          </div>
-        )}
-      </div>
+          )}
 
-      {/* ── Right: Move list + analyze button ── */}
-      <div className="flex-1 min-w-[220px] flex flex-col gap-3">
-
-        {/* Analyze button */}
-        <button
-          onClick={analyze}
-          disabled={analyzing || !stockfish.ready}
-          className="w-full py-2 bg-chess-green hover:bg-chess-green-dark disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
-        >
-          {analyzing
-            ? <span className="flex items-center justify-center gap-2">
-                <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin inline-block" />
-                Analyzing… {progress}%
-              </span>
-            : results.size > 0
-            ? 'Re-analyze'
-            : 'Analyze Game'}
-        </button>
-
-        {analyzeError && (
-          <div className="bg-red-900/30 border border-red-600/50 text-red-300 rounded-lg px-3 py-2 text-sm">
-            {analyzeError}
-          </div>
-        )}
-
-        {/* Progress bar while analyzing */}
-        {analyzing && (
-          <div className="w-full bg-chess-border rounded-full h-1.5">
-            <div
-              className="bg-chess-green h-1.5 rounded-full transition-all duration-300"
-              style={{ width: `${progress}%` }}
+          {/* Board */}
+          <div className="rounded-lg overflow-hidden shadow-2xl">
+            <Chessboard
+              position={displayFen}
+              boardWidth={480}
+              arePiecesDraggable={false}
+              customSquareStyles={highlightSquares}
+              customArrows={arrows as any}
+              customBoardStyle={{ borderRadius: '4px' }}
+              customDarkSquareStyle={{ backgroundColor: '#b58863' }}
+              customLightSquareStyle={{ backgroundColor: '#f0d9b5' }}
             />
           </div>
-        )}
 
-        {/* Move list */}
-        <div
-          ref={moveListRef}
-          className="bg-chess-bg-card border border-chess-border rounded-lg p-3 max-h-[520px] overflow-y-auto"
-        >
-          <div className="space-y-0.5">
-            {Array.from({ length: Math.ceil(moves.length / 2) }, (_, pairIdx) => {
-              const wIdx = pairIdx * 2;
-              const bIdx = pairIdx * 2 + 1;
-              const wMove = moves[wIdx];
-              const bMove = moves[bIdx];
-              return (
-                <div key={pairIdx} className="flex items-center gap-0.5 text-sm">
-                  <span className="text-chess-text-secondary w-8 text-right shrink-0 mr-1 select-none">
-                    {pairIdx + 1}.
-                  </span>
-                  {wMove && (
-                    <MoveButton
-                      move={wMove}
-                      result={results.get(wIdx)}
-                      isActive={viewIndex === wIdx + 1}
-                      onClick={() => setViewIndex(wIdx + 1)}
-                    />
-                  )}
-                  {bMove ? (
-                    <MoveButton
-                      move={bMove}
-                      result={results.get(bIdx)}
-                      isActive={viewIndex === bIdx + 1}
-                      onClick={() => setViewIndex(bIdx + 1)}
-                    />
-                  ) : <span className="w-20" />}
-                </div>
-              );
-            })}
+          {/* Navigation */}
+          <div className="flex items-center gap-1.5">
+            <NavBtn onClick={() => setViewIndex(0)}                             disabled={viewIndex === 0}                    title="Start">⏮</NavBtn>
+            <NavBtn onClick={() => setViewIndex(i => Math.max(0, i - 1))}       disabled={viewIndex === 0}                    title="← Prev">◀</NavBtn>
+            <NavBtn onClick={() => setViewIndex(i => Math.min(fenHistory.length - 1, i + 1))} disabled={viewIndex === fenHistory.length - 1} title="Next →">▶</NavBtn>
+            <NavBtn onClick={() => setViewIndex(fenHistory.length - 1)}         disabled={viewIndex === fenHistory.length - 1} title="End">⏭</NavBtn>
+            <span className="text-chess-text-secondary text-xs ml-1 select-none">
+              {viewIndex === 0 ? 'Start' : `Move ${viewIndex} / ${moves.length}`}
+            </span>
           </div>
+
+          {/* Move detail panel */}
+          {viewMove && (
+            <div className={`border rounded-lg px-4 py-3 text-sm
+              ${viewResult ? ANNOT[viewResult.annotation].bg : 'bg-chess-bg-card border-chess-border'}`}>
+              <div className="flex items-center justify-between">
+                <span className="font-bold text-chess-text-primary text-base">
+                  {Math.ceil(viewIndex / 2)}{viewMove.color === 'b' ? '…' : '.'} {viewMove.san}
+                  {viewResult?.annotation && ANNOT[viewResult.annotation].symbol && (
+                    <sup className="ml-1 text-sm">{ANNOT[viewResult.annotation].symbol}</sup>
+                  )}
+                </span>
+                {viewResult && (
+                  <span className="font-semibold" style={{ color: ANNOT[viewResult.annotation].color }}>
+                    {ANNOT[viewResult.annotation].label}
+                  </span>
+                )}
+              </div>
+              {viewResult && viewResult.cpLoss > 5 && (
+                <p className="text-chess-text-secondary mt-1 text-xs">
+                  −{viewResult.cpLoss} cp
+                  {(viewResult.bestMove?.length ?? 0) >= 4 && (
+                    <> · Best: <code className="font-mono" style={{ color: ANNOT.best.color }}>
+                      {viewResult.bestMove!.slice(0, 2)}→{viewResult.bestMove!.slice(2, 4)}
+                    </code></>
+                  )}
+                </p>
+              )}
+            </div>
+          )}
         </div>
 
-        <p className="text-chess-text-secondary text-xs text-center opacity-60">
-          ← → arrow keys to navigate
-        </p>
+        {/* Right: analyze button + move list */}
+        <div className="flex-1 min-w-[220px] flex flex-col gap-3">
+
+          {/* Analyze button */}
+          <button
+            onClick={analyze}
+            disabled={analyzing || !stockfish.ready}
+            className="w-full py-2 bg-chess-green hover:bg-chess-green-dark disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
+          >
+            {analyzing
+              ? <span className="flex items-center justify-center gap-2">
+                  <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  Analyzing… {progress}%
+                </span>
+              : results.size > 0 ? 'Re-analyze' : 'Analyze Game'}
+          </button>
+
+          {analyzeError && (
+            <div className="bg-red-900/30 border border-red-600/50 text-red-300 rounded-lg px-3 py-2 text-sm">
+              {analyzeError}
+            </div>
+          )}
+
+          {analyzing && (
+            <div className="w-full bg-chess-border rounded-full h-1">
+              <div className="bg-chess-green h-1 rounded-full transition-all duration-200"
+                style={{ width: `${progress}%` }} />
+            </div>
+          )}
+
+          {/* Move list */}
+          <div ref={moveListRef}
+            className="bg-chess-bg-card border border-chess-border rounded-lg p-3 max-h-[480px] overflow-y-auto">
+            <div className="space-y-0.5">
+              {Array.from({ length: Math.ceil(moves.length / 2) }, (_, p) => {
+                const wi = p * 2, bi = p * 2 + 1;
+                return (
+                  <div key={p} className="flex items-center gap-0.5 text-sm">
+                    <span className="text-chess-text-secondary w-8 text-right shrink-0 mr-1 select-none">
+                      {p + 1}.
+                    </span>
+                    <MoveBtn move={moves[wi]} result={results.get(wi)}
+                      isActive={viewIndex === wi + 1} onClick={() => setViewIndex(wi + 1)} />
+                    {moves[bi]
+                      ? <MoveBtn move={moves[bi]} result={results.get(bi)}
+                          isActive={viewIndex === bi + 1} onClick={() => setViewIndex(bi + 1)} />
+                      : <span className="w-20" />}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <p className="text-chess-text-secondary text-xs text-center opacity-50 select-none">
+            ← → arrow keys to navigate · click graph to jump
+          </p>
+        </div>
       </div>
     </div>
   );
@@ -400,60 +556,45 @@ function NavBtn({ onClick, disabled, title, children }: {
   onClick: () => void; disabled: boolean; title: string; children: React.ReactNode;
 }) {
   return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      title={title}
-      className="px-2 py-1.5 bg-chess-bg-card hover:bg-chess-bg-hover disabled:opacity-30 rounded text-chess-text-primary text-sm transition-colors"
-    >
+    <button onClick={onClick} disabled={disabled} title={title}
+      className="px-2 py-1.5 bg-chess-bg-card hover:bg-chess-bg-hover disabled:opacity-30 rounded text-chess-text-primary text-sm transition-colors">
       {children}
     </button>
   );
 }
 
 function AccBar({ label, pct }: { label: string; pct: number | null }) {
-  if (pct === null) return (
-    <div className="flex items-center gap-2">
-      <span className="text-chess-text-secondary w-12">{label}</span>
-      <span className="text-chess-text-secondary text-xs">–</span>
-    </div>
-  );
-  const color = pct >= 85 ? '#769656' : pct >= 65 ? '#eab308' : '#ef4444';
+  const color = pct === null ? '#888' : pct >= 85 ? '#769656' : pct >= 65 ? '#e8c94c' : '#e74c3c';
   return (
     <div className="flex items-center gap-2">
-      <span className="text-chess-text-secondary w-12">{label}</span>
-      <div className="w-24 bg-chess-border rounded-full h-2">
-        <div className="h-2 rounded-full transition-all" style={{ width: `${pct}%`, backgroundColor: color }} />
-      </div>
-      <span className="font-semibold text-chess-text-primary" style={{ color }}>{pct}%</span>
+      <span className="text-chess-text-secondary text-sm w-10">{label}</span>
+      {pct !== null ? (
+        <>
+          <div className="w-20 bg-chess-border rounded-full h-1.5">
+            <div className="h-1.5 rounded-full" style={{ width: `${pct}%`, backgroundColor: color }} />
+          </div>
+          <span className="text-sm font-semibold" style={{ color }}>{pct}%</span>
+        </>
+      ) : <span className="text-chess-text-secondary text-xs">–</span>}
     </div>
   );
 }
 
-function MoveButton({ move, result, isActive, onClick }: {
-  move: ParsedMove;
-  result?: MoveResult;
-  isActive: boolean;
-  onClick: () => void;
+function MoveBtn({ move, result, isActive, onClick }: {
+  move?: ParsedMove; result?: MoveResult; isActive: boolean; onClick: () => void;
 }) {
-  const cfg = result ? ANNOT_CFG[result.annotation] : null;
-
+  if (!move) return <span className="w-20" />;
+  const cfg = result ? ANNOT[result.annotation] : null;
   return (
     <button
       data-active={isActive ? 'true' : undefined}
       onClick={onClick}
-      className={`
-        w-20 text-left px-1.5 py-0.5 rounded font-mono text-sm transition-colors select-none
-        ${isActive
-          ? 'bg-chess-green/30 ring-1 ring-chess-green/60'
-          : 'hover:bg-chess-bg-hover'}
-      `}
+      className={`w-20 text-left px-1.5 py-0.5 rounded font-mono text-sm transition-colors select-none
+        ${isActive ? 'bg-chess-green/30 ring-1 ring-chess-green/60' : 'hover:bg-chess-bg-hover'}`}
       style={{ color: cfg?.color ?? '#c8c8c8' }}
     >
       {move.san}
-      {cfg?.symbol && (
-        <sup className="text-xs ml-0.5 opacity-90">{cfg.symbol}</sup>
-      )}
+      {cfg?.symbol ? <sup className="text-xs ml-0.5 opacity-90">{cfg.symbol}</sup> : null}
     </button>
   );
 }

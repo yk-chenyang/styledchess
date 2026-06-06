@@ -89,8 +89,8 @@ export function useStockfish() {
         resolve();
       };
 
-      // If the engine is already idle stop produces no output → 50 ms fallback
-      const fallback = setTimeout(finish, 50);
+      // If the engine is already idle stop produces no output → 10 ms fallback
+      const fallback = setTimeout(finish, 10);
 
       const handler = (msg: string): boolean => {
         if (msg.startsWith('bestmove')) { finish(); return true; }
