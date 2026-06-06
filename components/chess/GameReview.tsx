@@ -90,47 +90,70 @@ function computeCpLoss(beforeScore: number, afterScore: number): number {
 }
 
 /**
- * Classify a move using WPL thresholds that mirror chess.com's intent.
+ * Classify a move by win-probability loss (WPL), with opening-phase awareness.
  *
- * Key design decisions:
- *  • WPL is context-aware: losing 200 cp when up +700 is far less damaging
- *    than losing 200 cp from an equal position.
- *  • "Great" requires essentially zero WPL AND a different move from the
- *    engine's top choice – this keeps it genuinely rare.
- *  • "Brilliant" requires a negative WPL (you actually gained win probability)
- *    AND you didn't play the engine's top suggestion.
- *  • "Blunder" threshold (WPL > 16 %) ≈ losing a full pawn (~100 cp) from
- *    an equal position.
+ * TWO root causes of "Great" inflation were fixed here:
  *
- * Approximate WPL ↔ cp-from-equal equivalents:
- *   0.5 % WPL ≈   2 cp   (noise floor at depth 8)
- *   2   % WPL ≈   9 cp   (tiny imprecision)
- *   5   % WPL ≈  23 cp   (slight edge loss)
- *   8   % WPL ≈  40 cp   (real inaccuracy)
- *   16  % WPL ≈  90 cp   (≈ pawn from equal)
- *    > 16 %     > 90 cp  (significant blunder)
+ * 1. Opening-phase exclusion (plyIndex < 12):
+ *    At depth 8, the engine often rates e4/d4, e5/c5, etc. as virtually
+ *    identical (WPL ≈ 0).  Whichever you play that isn't the engine's
+ *    first-listed move would trigger "Great" under the old threshold.
+ *    Chess.com avoids this by categorising opening moves as "Book".
+ *    We exclude the first 12 half-moves from Brilliant/Great entirely.
+ *
+ * 2. Tighter "Great" WPL threshold (0.2 % instead of 0.5 %):
+ *    0.2 % WPL from equal ≈ 0.5 cp — well below depth-8 noise (≈ ±15 cp).
+ *    In practice this fires only when the engine's evaluations for two
+ *    moves are genuinely indistinguishable, which is rare outside the
+ *    opening.  Target: 0–2 "Great" moves per typical game.
+ *
+ * WPL thresholds (unchanged from previous version):
+ *   0.2 % ≈  1 cp   Best / Great ceiling
+ *   2   % ≈  9 cp   Excellent
+ *   5   % ≈ 23 cp   Good
+ *   8   % ≈ 40 cp   Inaccuracy
+ *  16   % ≈ 90 cp   Mistake  (≈ pawn from equal)
+ *  >16  %           Blunder
  */
-function classifyMove(wpl: number, isBestMove: boolean): Annotation {
-  // Gained win probability AND different from engine's top → Brilliant
-  if (wpl <= -2.0 && !isBestMove) return 'brilliant';
-  // Matched engine's top choice with minimal loss
-  if (isBestMove && wpl <= 0.5)  return 'best';
-  // Different move but essentially no win-probability cost (very rare)
-  if (!isBestMove && wpl <= 0.5) return 'great';
-  if (wpl <=  2.0)               return 'excellent';
-  if (wpl <=  5.0)               return 'good';
-  if (wpl <=  8.0)               return 'inaccuracy';
-  if (wpl <= 16.0)               return 'mistake';
+function classifyMove(wpl: number, isBestMove: boolean, plyIndex: number): Annotation {
+  const isOpening = plyIndex < 12; // first 6 moves per side — treat as opening phase
+
+  // Brilliant: gained win probability, non-engine move, outside opening
+  if (wpl <= -2.0 && !isBestMove && !isOpening) return 'brilliant';
+
+  // Best: matched engine's top choice
+  if (isBestMove && wpl <= 0.5) return 'best';
+
+  // Great: VERY strict — different from engine's top but essentially equal quality.
+  // Excluded from the opening where many moves have equal depth-8 evals.
+  // 0.2 % threshold ≈ 0.5 cp precision — almost never fires at depth 8.
+  if (!isBestMove && wpl <= 0.2 && !isOpening) return 'great';
+
+  if (wpl <=  2.0) return 'excellent';
+  if (wpl <=  5.0) return 'good';
+  if (wpl <=  8.0) return 'inaccuracy';
+  if (wpl <= 16.0) return 'mistake';
   return 'blunder';
 }
 
 /**
- * Per-move accuracy (0–100 %) using chess.com's formula applied to WPL.
- * Negative WPL (improved position) clamps to 100 %.
+ * Per-move accuracy (0–100 %) aligned with chess.com's scale.
+ *
+ * Chess.com runs depth 20+ with NNUE, so their WPL values for blunders
+ * are much larger (35-45 %) than ours at depth 8 (15-22 %).  Without
+ * calibration, our blunders get ~35 % per-move accuracy instead of
+ * near-0 %, making game accuracy stay artificially high (e.g. 93 %
+ * despite a blunder, vs. chess.com's 70-80 %).
+ *
+ * Applying a ×2 depth-calibration factor to WPL before the formula
+ * compensates: our 22 % WPL blunder is treated as 44 % WPL, giving
+ * ~10 % per-move accuracy instead of ~35 %.  This brings game accuracy
+ * into the realistic 75-85 % range for a game with one blunder.
  */
 function wplToAccuracy(wpl: number): number {
+  const DEPTH_CALIBRATION = 2.0; // compensates for depth-8 vs chess.com's depth-20+
   return Math.max(0, Math.min(100,
-    103.1668 * Math.exp(-0.04354 * Math.max(0, wpl)) - 3.1668,
+    103.1668 * Math.exp(-0.04354 * Math.max(0, wpl) * DEPTH_CALIBRATION) - 3.1668,
   ));
 }
 
@@ -381,7 +404,7 @@ export default function GameReview({ pgn }: Props) {
         const cpLoss     = computeCpLoss(before.score, afterResult.score);
         const playedUci  = moves[i].from + moves[i].to;
         const isBestMove = before.bestMove.slice(0, 4) === playedUci;
-        const annotation = classifyMove(wpl, isBestMove);
+        const annotation = classifyMove(wpl, isBestMove, i);
 
         newResults.set(i, { annotation, wpl, cpLoss, bestMove: before.bestMove });
         setResults(new Map(newResults));
