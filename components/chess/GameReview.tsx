@@ -12,16 +12,16 @@ type Annotation =
   | 'blunder'     // ?? red
   | 'mistake'     // ?  orange
   | 'inaccuracy'  // ?! yellow
-  | 'good'        //    green-grey (no symbol)
-  | 'excellent'   //    light green (no symbol)
-  | 'best'        // ✓  green  (matched engine's top move)
-  | 'great'       // !  blue   (very close but different from engine's top)
-  | 'brilliant';  // !! teal   (impressive sacrifice / improvement)
+  | 'good'        //    no mark
+  | 'excellent'   //    no mark
+  | 'best'        // ✓  green
+  | 'great'       // !  blue
+  | 'brilliant';  // !! teal
 
 interface MoveResult {
   annotation: Annotation;
-  wpl: number;      // win-probability loss % (used for classification & accuracy)
-  cpLoss: number;   // raw centipawn loss (shown in detail panel)
+  wpl: number;
+  cpLoss: number;
   bestMove: string;
 }
 
@@ -38,10 +38,10 @@ interface ParsedMove {
 const ANNOT: Record<Annotation, {
   label: string;
   symbol: string;
-  color: string;        // text / accent
-  arrowColor: string;   // played-move arrow
-  bg: string;           // detail-panel tailwind
-  graphDot: string | null;  // dot on graph (null = don't show)
+  color: string;
+  arrowColor: string;
+  bg: string;
+  graphDot: string | null;
 }> = {
   brilliant:  { label:'Brilliant',  symbol:'!!', color:'#1baca6', arrowColor:'rgba(27,172,166,0.85)',  bg:'bg-teal-900/40 border-teal-500',     graphDot:'#1baca6' },
   great:      { label:'Great',      symbol:'!',  color:'#5882cd', arrowColor:'rgba(88,130,205,0.85)',  bg:'bg-blue-900/30 border-blue-500',     graphDot:'#5882cd' },
@@ -56,7 +56,7 @@ const ANNOT: Record<Annotation, {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /**
- * Win probability for the side with `cp` centipawn advantage (0–100 %).
+ * Win probability for the side with `cp` centipawn advantage.
  * Uses the same sigmoid coefficient chess.com's engine pipeline uses.
  */
 function cpToWinPct(cp: number): number {
@@ -64,16 +64,11 @@ function cpToWinPct(cp: number): number {
 }
 
 /**
- * Win-probability loss (WPL) for the side that just moved, in percentage points.
+ * Win-probability loss (WPL) for the side that just moved.
  *
- * Both parameters come straight from analyzePosition():
- *   beforeScore  – eval from the MOVING side's perspective (positive = they're winning)
- *   afterScore   – eval from the OPPONENT's perspective after the move (positive = opponent winning)
+ * beforeScore – eval from the moving side's perspective (positive = they're winning)
+ * afterScore  – eval from the opponent's perspective after the move
  *
- * Because the side-to-move flips after the move, the moving side's win %
- * after the move is cpToWinPct(-afterScore).
- *
- * The same formula works for both white and black.
  * Positive WPL = lost win probability (bad move).
  * Negative WPL = gained win probability (great / brilliant move).
  */
@@ -81,79 +76,52 @@ function computeWPL(beforeScore: number, afterScore: number): number {
   return cpToWinPct(beforeScore) - cpToWinPct(-afterScore);
 }
 
-/**
- * Raw centipawn loss (for display only – NOT used for classification).
- * Same symmetry trick: max(0, beforeScore + afterScore).
- */
 function computeCpLoss(beforeScore: number, afterScore: number): number {
   return Math.max(0, beforeScore + afterScore);
 }
 
 /**
- * Classify a move by win-probability loss (WPL), with opening-phase awareness.
+ * Classify a move by WPL, aligned with chess.com's thresholds.
  *
- * TWO root causes of "Great" inflation were fixed here:
+ * Chess.com's documented thresholds:
+ *   ≤  0%   Best / Great
+ *   ≤  2%   Excellent
+ *   ≤  5%   Good
+ *   ≤ 10%   Inaccuracy
+ *   ≤ 20%   Mistake
+ *   > 20%   Blunder
  *
- * 1. Opening-phase exclusion (plyIndex < 12):
- *    At depth 8, the engine often rates e4/d4, e5/c5, etc. as virtually
- *    identical (WPL ≈ 0).  Whichever you play that isn't the engine's
- *    first-listed move would trigger "Great" under the old threshold.
- *    Chess.com avoids this by categorising opening moves as "Book".
- *    We exclude the first 12 half-moves from Brilliant/Great entirely.
- *
- * 2. Tighter "Great" WPL threshold (0.2 % instead of 0.5 %):
- *    0.2 % WPL from equal ≈ 0.5 cp — well below depth-8 noise (≈ ±15 cp).
- *    In practice this fires only when the engine's evaluations for two
- *    moves are genuinely indistinguishable, which is rare outside the
- *    opening.  Target: 0–2 "Great" moves per typical game.
- *
- * WPL thresholds (unchanged from previous version):
- *   0.2 % ≈  1 cp   Best / Great ceiling
- *   2   % ≈  9 cp   Excellent
- *   5   % ≈ 23 cp   Good
- *   8   % ≈ 40 cp   Inaccuracy
- *  16   % ≈ 90 cp   Mistake  (≈ pawn from equal)
- *  >16  %           Blunder
+ * Opening phase (first 10 ply) is excluded from Brilliant/Great because at that
+ * stage many moves are theoretically equivalent and we lack opening-book detection.
  */
 function classifyMove(wpl: number, isBestMove: boolean, plyIndex: number): Annotation {
-  const isOpening = plyIndex < 12; // first 6 moves per side — treat as opening phase
+  const isOpening = plyIndex < 10; // first 5 moves per side
 
-  // Brilliant: gained win probability, non-engine move, outside opening
-  if (wpl <= -2.0 && !isBestMove && !isOpening) return 'brilliant';
+  // Brilliant: non-engine move that actually improves win probability (creative sacrifice)
+  if (wpl <= -3.0 && !isBestMove && !isOpening) return 'brilliant';
 
-  // Best: matched engine's top choice
-  if (isBestMove && wpl <= 0.5) return 'best';
+  // Best: engine confirmed this is the top move — no WPL guard needed
+  if (isBestMove) return 'best';
 
-  // Great: VERY strict — different from engine's top but essentially equal quality.
-  // Excluded from the opening where many moves have equal depth-8 evals.
-  // 0.2 % threshold ≈ 0.5 cp precision — almost never fires at depth 8.
-  if (!isBestMove && wpl <= 0.2 && !isOpening) return 'great';
+  // Great: different from engine's top but essentially equal evaluation
+  if (wpl <= 0.5 && !isOpening) return 'great';
 
   if (wpl <=  2.0) return 'excellent';
   if (wpl <=  5.0) return 'good';
-  if (wpl <=  8.0) return 'inaccuracy';
-  if (wpl <= 16.0) return 'mistake';
+  if (wpl <= 10.0) return 'inaccuracy'; // chess.com threshold
+  if (wpl <= 20.0) return 'mistake';    // chess.com threshold
   return 'blunder';
 }
 
 /**
- * Per-move accuracy (0–100 %) aligned with chess.com's scale.
+ * Per-move accuracy (0–100%) using chess.com's published formula.
  *
- * Chess.com runs depth 20+ with NNUE, so their WPL values for blunders
- * are much larger (35-45 %) than ours at depth 8 (15-22 %).  Without
- * calibration, our blunders get ~35 % per-move accuracy instead of
- * near-0 %, making game accuracy stay artificially high (e.g. 93 %
- * despite a blunder, vs. chess.com's 70-80 %).
- *
- * Applying a ×2 depth-calibration factor to WPL before the formula
- * compensates: our 22 % WPL blunder is treated as 44 % WPL, giving
- * ~10 % per-move accuracy instead of ~35 %.  This brings game accuracy
- * into the realistic 75-85 % range for a game with one blunder.
+ * With NNUE at depth 16, WPL values are close to chess.com's depth-20+ output,
+ * so the formula is applied directly with no calibration multiplier.
  */
 function wplToAccuracy(wpl: number): number {
-  const DEPTH_CALIBRATION = 2.0; // compensates for depth-8 vs chess.com's depth-20+
   return Math.max(0, Math.min(100,
-    103.1668 * Math.exp(-0.04354 * Math.max(0, wpl) * DEPTH_CALIBRATION) - 3.1668,
+    103.1668 * Math.exp(-0.04354 * Math.max(0, wpl)) - 3.1668,
   ));
 }
 
@@ -186,28 +154,19 @@ function EvalGraph({
   const n = scores.length;
   const hasData = scores.some(s => s !== null);
 
-  // Convert white-perspective cp → Y pixel (top = white winning max, bottom = black winning max)
   const toY = (cp: number | null) => {
-    const pct = cpToWinPct(cp ?? 0); // 0–100, 50 = equal
-    // pct=100 → y=2 (top, white winning)
-    // pct=50  → y=GRAPH_H/2 (middle)
-    // pct=0   → y=GRAPH_H-2 (bottom, black winning)
+    const pct = cpToWinPct(cp ?? 0);
     return 2 + ((100 - pct) / 100) * (GRAPH_H - 4);
   };
 
-  const midY = toY(0); // ≈ GRAPH_H/2
-
-  const xAt = (i: number) =>
-    n <= 1 ? W / 2 : (i / (n - 1)) * W;
-
-  // Build SVG path of the evaluation curve
+  const midY = toY(0);
+  const xAt = (i: number) => n <= 1 ? W / 2 : (i / (n - 1)) * W;
   const pts = scores.map((s, i) => [xAt(i), toY(s)] as [number, number]);
 
   const curvePath = pts.length < 2
     ? ''
     : pts.map(([x, y], i) => `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
 
-  // White-territory fill: from the curve DOWN to the bottom edge
   const whiteFill = pts.length < 2
     ? ''
     : [
@@ -218,15 +177,13 @@ function EvalGraph({
         'Z',
       ].join(' ');
 
-  // Dots for notable moves (inaccuracy / mistake / blunder / great / brilliant)
   const dots = Array.from(results.entries())
     .filter(([, r]) => ANNOT[r.annotation].graphDot !== null)
     .map(([i, r]) => {
-      const posIdx = i + 1; // result[i] describes move i, leading to position i+1
+      const posIdx = i + 1;
       return { x: xAt(posIdx), y: toY(scores[posIdx] ?? null), color: ANNOT[r.annotation].graphDot! };
     });
 
-  // Indicator for current position
   const indX = viewIndex >= 0 && viewIndex < n ? xAt(viewIndex) : null;
   const indY = indX !== null ? toY(scores[viewIndex] ?? null) : null;
 
@@ -243,23 +200,15 @@ function EvalGraph({
       style={{ height: GRAPH_H, background: '#1a1a2a' }}
     >
       <svg width={W} height={GRAPH_H} className="block cursor-pointer" onClick={handleClick}>
-        {/* Dark background */}
         <rect x={0} y={0} width={W} height={GRAPH_H} fill="#1a1a2a" />
 
         {hasData && (
           <>
-            {/* White territory (below curve = white winning) */}
             <path d={whiteFill} fill="rgba(230,230,230,0.90)" />
-
-            {/* Midline */}
             <line x1={0} y1={midY} x2={W} y2={midY}
               stroke="rgba(160,160,160,0.2)" strokeWidth="1" />
-
-            {/* Evaluation curve */}
             <path d={curvePath} fill="none"
               stroke="rgba(200,200,200,0.55)" strokeWidth="1.5" />
-
-            {/* Annotation dots on the curve */}
             {dots.map((d, k) => (
               <circle key={k} cx={d.x} cy={d.y} r={4}
                 fill={d.color} stroke="rgba(0,0,0,0.5)" strokeWidth={1} />
@@ -267,7 +216,6 @@ function EvalGraph({
           </>
         )}
 
-        {/* Current-position indicator */}
         {indX !== null && (
           <>
             <line x1={indX} y1={0} x2={indX} y2={GRAPH_H}
@@ -293,7 +241,6 @@ export default function GameReview({ pgn }: Props) {
   const [viewIndex, setViewIndex]   = useState(0);
 
   const [results, setResults]           = useState<Map<number, MoveResult>>(new Map());
-  /** White-perspective centipawn score for each position (index = viewIndex). */
   const [posScores, setPosScores]       = useState<(number | null)[]>([]);
   const posScoresRef                    = useRef<(number | null)[]>([]);
 
@@ -305,7 +252,7 @@ export default function GameReview({ pgn }: Props) {
   const moveListRef  = useRef<HTMLDivElement>(null);
   const analyzingRef = useRef(false);
 
-  // ─── Parse PGN immediately ────────────────────────────────────────────────
+  // ─── Parse PGN ────────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (!pgn?.trim()) return;
@@ -365,6 +312,14 @@ export default function GameReview({ pgn }: Props) {
   }, [fenHistory.length]);
 
   // ─── Analysis ─────────────────────────────────────────────────────────────
+  //
+  // Approach: analyze each of the N+1 positions ONCE (not twice per move).
+  // For a game of N moves, this means N+1 engine calls instead of 2N.
+  // As each pair of consecutive positions is ready, we immediately classify
+  // the move between them so the UI updates progressively.
+  //
+  // Engine: Stockfish 16 NNUE at depth 16 — close to chess.com's depth-20+
+  // quality, producing WPL values that feed directly into the accuracy formula.
 
   const analyze = useCallback(async () => {
     if (!stockfish.ready || analyzingRef.current || moves.length === 0) return;
@@ -375,39 +330,43 @@ export default function GameReview({ pgn }: Props) {
     posScoresRef.current = new Array(fenHistory.length).fill(null);
     setAnalyzeError('');
 
-    const newResults = new Map<number, MoveResult>();
+    // Reset to full engine strength for analysis (bot play may have changed skill level)
+    stockfish.configure({ skillLevel: 20, contempt: 0 });
 
-    for (let i = 0; i < moves.length; i++) {
-      setProgress(Math.round(((i + 1) / moves.length) * 100));
-      const fenBefore = fenHistory[i];
-      const fenAfter  = fenHistory[i + 1];
-      if (!fenBefore || !fenAfter) continue;
+    const newResults = new Map<number, MoveResult>();
+    const posAnalyses: Array<{ score: number; bestMove: string; pv: string[] } | null> =
+      new Array(fenHistory.length).fill(null);
+
+    for (let i = 0; i < fenHistory.length; i++) {
+      setProgress(Math.round(((i + 1) / fenHistory.length) * 100));
+      const fen = fenHistory[i];
+      if (!fen) continue;
 
       try {
-        const before      = await stockfish.analyzePosition(fenBefore, 8);
-        const afterResult = await stockfish.analyzePosition(fenAfter,  8);
+        const result = await stockfish.analyzePosition(fen, 16);
+        posAnalyses[i] = result;
 
-        // White-perspective scores for the evaluation graph
-        // FEN second field is the side to move ('w' or 'b')
-        const turnBefore = fenBefore.split(' ')[1];
-        const turnAfter  = fenAfter.split(' ')[1];
-        const whiteCpBefore = turnBefore === 'w' ?  before.score : -before.score;
-        const whiteCpAfter  = turnAfter  === 'w' ? afterResult.score : -afterResult.score;
-
-        posScoresRef.current[i]     = whiteCpBefore;
-        posScoresRef.current[i + 1] = whiteCpAfter;
+        // Update the evaluation graph (white-perspective score)
+        const turn = fen.split(' ')[1];
+        posScoresRef.current[i] = turn === 'w' ? result.score : -result.score;
         setPosScores([...posScoresRef.current]);
 
-        // Win-probability loss drives classification (context-aware, mirrors chess.com).
-        // Raw cpLoss is kept for the detail panel display only.
-        const wpl        = computeWPL(before.score, afterResult.score);
-        const cpLoss     = computeCpLoss(before.score, afterResult.score);
-        const playedUci  = moves[i].from + moves[i].to;
-        const isBestMove = before.bestMove.slice(0, 4) === playedUci;
-        const annotation = classifyMove(wpl, isBestMove, i);
+        // Once we have two consecutive positions, classify the move between them
+        if (i > 0 && posAnalyses[i - 1] !== null) {
+          const before   = posAnalyses[i - 1]!;
+          const after    = result;
+          const moveIdx  = i - 1;
 
-        newResults.set(i, { annotation, wpl, cpLoss, bestMove: before.bestMove });
-        setResults(new Map(newResults));
+          const wpl        = computeWPL(before.score, after.score);
+          const cpLoss     = computeCpLoss(before.score, after.score);
+          const playedUci  = moves[moveIdx].from + moves[moveIdx].to;
+          // Compare first 4 chars of UCI (handles promotions gracefully)
+          const isBestMove = before.bestMove.slice(0, 4) === playedUci;
+          const annotation = classifyMove(wpl, isBestMove, moveIdx);
+
+          newResults.set(moveIdx, { annotation, wpl, cpLoss, bestMove: before.bestMove });
+          setResults(new Map(newResults));
+        }
       } catch {
         // skip on error
       }
@@ -443,7 +402,6 @@ export default function GameReview({ pgn }: Props) {
     return sq;
   }, [viewMove, displayFen]);
 
-  // Arrows: played move (colored by annotation) + engine's best (green) if different
   const arrows = useMemo((): [string, string, string][] => {
     if (!viewMove) return [];
     const arr: [string, string, string][] = [];
@@ -465,8 +423,22 @@ export default function GameReview({ pgn }: Props) {
     results.forEach((r, i) => {
       (moves[i]?.color === 'w' ? w : b).push(wplToAccuracy(r.wpl));
     });
-    const avg = (a: number[]) => a.length ? Math.round(a.reduce((s, v) => s + v, 0) / a.length) : null;
+    const avg = (a: number[]) =>
+      a.length ? parseFloat((a.reduce((s, v) => s + v, 0) / a.length).toFixed(1)) : null;
     return { whiteAcc: avg(w), blackAcc: avg(b) };
+  }, [results, moves]);
+
+  // Per-color category counts (like chess.com's summary panel)
+  const categoryCounts = useMemo(() => {
+    const empty = (): Record<Annotation, number> => ({
+      brilliant: 0, great: 0, best: 0, excellent: 0,
+      good: 0, inaccuracy: 0, mistake: 0, blunder: 0,
+    });
+    const w = empty(), b = empty();
+    results.forEach((r, i) => {
+      (moves[i]?.color === 'w' ? w : b)[r.annotation]++;
+    });
+    return { white: w, black: b };
   }, [results, moves]);
 
   // ─── Render ───────────────────────────────────────────────────────────────
@@ -482,7 +454,7 @@ export default function GameReview({ pgn }: Props) {
   return (
     <div className="flex flex-col gap-4">
 
-      {/* ── Evaluation graph — full width ─────────────────────────── */}
+      {/* ── Evaluation graph ─────────────────────────────────────── */}
       <EvalGraph
         scores={posScores}
         results={results}
@@ -496,11 +468,17 @@ export default function GameReview({ pgn }: Props) {
         {/* Left: board + accuracy + nav + detail */}
         <div className="flex flex-col gap-3">
 
-          {/* Accuracy bars (shown once analysis has results) */}
+          {/* Accuracy + category summary */}
           {(whiteAcc !== null || blackAcc !== null) && (
-            <div className="flex gap-8 bg-chess-bg-card border border-chess-border rounded-lg px-4 py-2.5">
-              <AccBar label="White" pct={whiteAcc} />
-              <AccBar label="Black" pct={blackAcc} />
+            <div className="bg-chess-bg-card border border-chess-border rounded-lg px-4 py-3">
+              <div className="flex gap-8 mb-2">
+                <AccBar label="White" pct={whiteAcc} />
+                <AccBar label="Black" pct={blackAcc} />
+              </div>
+              <CategoryTable
+                whiteCounts={categoryCounts.white}
+                blackCounts={categoryCounts.black}
+              />
             </div>
           )}
 
@@ -564,7 +542,6 @@ export default function GameReview({ pgn }: Props) {
         {/* Right: analyze button + move list */}
         <div className="flex-1 min-w-[220px] flex flex-col gap-3">
 
-          {/* Analyze button */}
           <button
             onClick={analyze}
             disabled={analyzing || !stockfish.ready}
@@ -586,7 +563,7 @@ export default function GameReview({ pgn }: Props) {
 
           {analyzing && (
             <div className="w-full bg-chess-border rounded-full h-1">
-              <div className="bg-chess-green h-1 rounded-full transition-all duration-200"
+              <div className="bg-chess-green h-1 rounded-full transition-all duration-300"
                 style={{ width: `${progress}%` }} />
             </div>
           )}
@@ -617,6 +594,12 @@ export default function GameReview({ pgn }: Props) {
           <p className="text-chess-text-secondary text-xs text-center opacity-50 select-none">
             ← → arrow keys to navigate · click graph to jump
           </p>
+
+          {analyzing && (
+            <p className="text-chess-text-secondary text-xs text-center opacity-60 select-none">
+              Deep analysis (depth 16 NNUE) — typically 1–3 min for a full game
+            </p>
+          )}
         </div>
       </div>
     </div>
@@ -637,7 +620,7 @@ function NavBtn({ onClick, disabled, title, children }: {
 }
 
 function AccBar({ label, pct }: { label: string; pct: number | null }) {
-  const color = pct === null ? '#888' : pct >= 85 ? '#769656' : pct >= 65 ? '#e8c94c' : '#e74c3c';
+  const color = pct === null ? '#888' : pct >= 80 ? '#769656' : pct >= 60 ? '#e8c94c' : '#e74c3c';
   return (
     <div className="flex items-center gap-2">
       <span className="text-chess-text-secondary text-sm w-10">{label}</span>
@@ -649,6 +632,59 @@ function AccBar({ label, pct }: { label: string; pct: number | null }) {
           <span className="text-sm font-semibold" style={{ color }}>{pct}%</span>
         </>
       ) : <span className="text-chess-text-secondary text-xs">–</span>}
+    </div>
+  );
+}
+
+/**
+ * Per-category move count table, shown below accuracy bars.
+ * Matches chess.com's summary breakdown (only rows with ≥1 move shown).
+ */
+function CategoryTable({
+  whiteCounts,
+  blackCounts,
+}: {
+  whiteCounts: Record<Annotation, number>;
+  blackCounts: Record<Annotation, number>;
+}) {
+  const rows: Annotation[] = [
+    'brilliant', 'great', 'best', 'excellent', 'good',
+    'inaccuracy', 'mistake', 'blunder',
+  ];
+  const visibleRows = rows.filter(a => (whiteCounts[a] ?? 0) > 0 || (blackCounts[a] ?? 0) > 0);
+  if (visibleRows.length === 0) return null;
+
+  return (
+    <div className="border-t border-chess-border pt-2 mt-1">
+      {visibleRows.map(ann => {
+        const w = whiteCounts[ann] ?? 0;
+        const b = blackCounts[ann] ?? 0;
+        const cfg = ANNOT[ann];
+        return (
+          <div key={ann} className="flex items-center text-xs py-0.5 gap-1">
+            <span
+              style={{ color: cfg.color }}
+              className="w-5 text-center font-bold shrink-0 leading-none"
+            >
+              {cfg.symbol || '·'}
+            </span>
+            <span className="text-chess-text-secondary flex-1 truncate">{cfg.label}</span>
+            <span
+              className="w-7 text-right font-mono tabular-nums"
+              style={{ color: w > 0 ? cfg.color : '#4a4a5a' }}
+            >
+              {w}
+            </span>
+            <span className="text-chess-text-secondary opacity-30 px-0.5">|</span>
+            <span
+              className="w-7 text-left font-mono tabular-nums"
+              style={{ color: b > 0 ? cfg.color : '#4a4a5a' }}
+            >
+              {b}
+            </span>
+          </div>
+        );
+      })}
     </div>
   );
 }

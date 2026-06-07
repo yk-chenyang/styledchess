@@ -37,7 +37,9 @@ export function useStockfish() {
 
         // UCI init / idle handling
         if (msg === 'uciok') {
-          worker.postMessage('setoption name Use NNUE value false');
+          // NNUE is on by default in sf16-nnue — do NOT disable it.
+          // A small hash table helps avoid re-searching transpositions within one position.
+          worker.postMessage('setoption name Hash value 16');
           worker.postMessage('isready');
         } else if (msg === 'readyok') {
           setReady(true);
@@ -147,7 +149,7 @@ export function useStockfish() {
   const analyzePosition = useCallback(
     async (
       fen: string,
-      depth = 8,
+      depth = 16,
     ): Promise<{ score: number; bestMove: string; pv: string[] }> => {
       const w = workerRef.current;
       if (!w) return { score: 0, bestMove: '', pv: [] };
@@ -180,7 +182,7 @@ export function useStockfish() {
             return false;
           };
           w.postMessage('stop');
-        }, 12_000);
+        }, 20_000);
 
         const handler = (msg: string): boolean => {
           if (msg.startsWith('info')) {
