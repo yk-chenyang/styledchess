@@ -145,38 +145,70 @@ export function useStockfish() {
   );
 
   // ─── analyzePosition ─────────────────────────────────────────────────────
+  //
+  // Uses MultiPV=2 by default so we can tell when the played move is one of
+  // the engine's top-2 choices (→ Best), vs. merely close to best (→ Great).
+  // topMoves[0] is the #1 engine line, topMoves[1] is #2 (if available).
 
   const analyzePosition = useCallback(
     async (
       fen: string,
       depth = 16,
-    ): Promise<{ score: number; bestMove: string; pv: string[] }> => {
+      multiPv = 2,
+    ): Promise<{
+      score: number;
+      bestMove: string;
+      pv: string[];
+      topMoves: Array<{ move: string; score: number }>;
+    }> => {
       const w = workerRef.current;
-      if (!w) return { score: 0, bestMove: '', pv: [] };
+      if (!w) return { score: 0, bestMove: '', pv: [], topMoves: [] };
 
       await stopAndWait();
+
+      // Set MultiPV before the search begins
+      w.postMessage(`setoption name MultiPV value ${multiPv}`);
 
       return new Promise((resolve) => {
         let bestScore = 0;
         let bestMoveStr = '';
         let pvLine: string[] = [];
+        // Keyed by multipv rank (1-based); updated on every info depth line
+        const pvMap = new Map<number, { score: number; move: string }>();
+
+        const buildTopMoves = () =>
+          Array.from(pvMap.entries())
+            .sort(([a], [b]) => a - b)
+            .map(([, d]) => d);
 
         const finish = (bm: string) => {
           clearTimeout(timer);
           if (activeCallbackRef.current === handler) activeCallbackRef.current = null;
-          resolve({ score: bestScore, bestMove: bm, pv: pvLine });
+          // Reset MultiPV so bot-play is unaffected
+          w.postMessage('setoption name MultiPV value 1');
+          const topMoves = buildTopMoves();
+          resolve({
+            score: bestScore,
+            bestMove: bm || (topMoves[0]?.move ?? ''),
+            pv: pvLine,
+            topMoves,
+          });
         };
 
-        // Safety net: if search runs long, force-stop and take best result so far
         const timer = setTimeout(() => {
           if (activeCallbackRef.current !== handler) return;
-          // Replace our handler with a one-shot drain so the upcoming bestmove
-          // from the stop command is handled cleanly
           activeCallbackRef.current = (msg: string): boolean => {
             if (msg.startsWith('bestmove')) {
               activeCallbackRef.current = null;
               const bm = msg.split(' ')[1] ?? '';
-              resolve({ score: bestScore, bestMove: bm || bestMoveStr, pv: pvLine });
+              w.postMessage('setoption name MultiPV value 1');
+              const topMoves = buildTopMoves();
+              resolve({
+                score: bestScore,
+                bestMove: bm || bestMoveStr,
+                pv: pvLine,
+                topMoves,
+              });
               return true;
             }
             return false;
@@ -186,12 +218,26 @@ export function useStockfish() {
 
         const handler = (msg: string): boolean => {
           if (msg.startsWith('info')) {
-            const scp  = msg.match(/score cp (-?\d+)/);
+            const scp   = msg.match(/score cp (-?\d+)/);
             const smate = msg.match(/score mate (-?\d+)/);
-            const pv   = msg.match(/ pv (.+)/);
-            if (scp)   bestScore = parseInt(scp[1]);
-            if (smate) bestScore = parseInt(smate[1]) > 0 ? 30_000 : -30_000;
-            if (pv)    pvLine = pv[1].split(' ');
+            const pvM   = msg.match(/ pv ([a-h][1-8][a-h][1-8][qrbn]?)/);
+            const mpvM  = msg.match(/ multipv (\d+)/);
+            const fullPv = msg.match(/ pv (.+)/);
+
+            let score = 0;
+            if (scp)   score = parseInt(scp[1]);
+            if (smate) score = parseInt(smate[1]) > 0 ? 30_000 : -30_000;
+
+            const pvIdx    = mpvM ? parseInt(mpvM[1]) : 1;
+            const firstMv  = pvM ? pvM[1] : '';
+
+            if (firstMv) pvMap.set(pvIdx, { score, move: firstMv });
+
+            // Update primary score / PV from the #1 line
+            if (pvIdx === 1) {
+              if (scp || smate) bestScore = score;
+              if (fullPv) pvLine = fullPv[1].split(' ');
+            }
             return true;
           }
           if (msg.startsWith('bestmove')) {
